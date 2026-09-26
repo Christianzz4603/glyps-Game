@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.GlyphGrid" parent="android:Theme.Black.NoTitleBar.Fullscreen" />
+</resources>
