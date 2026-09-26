@@ -35,7 +35,7 @@ class MainActivity : Activity() {
             View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         )
 
-        renderer = GlyphRenderer()
+        renderer = GlyphRenderer(this)
         glView = object : GLSurfaceView(this) {
             override fun onTouchEvent(event: MotionEvent): Boolean {
                 handleTouch(event)

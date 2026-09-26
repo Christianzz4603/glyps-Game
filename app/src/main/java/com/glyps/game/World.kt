@@ -5,8 +5,13 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-// world/scene geometry: ground, road, buildings, trees, plus their collision shapes.
-// Mirrors the web and native-Rust prototypes of this renderer.
+// world/scene geometry: ground, road, houses, trees, one castle, plus their collision shapes.
+//
+// STATUS: this is still the original small fixed layout from the first prototype, plus one
+// added castle keep+towers below. It is NOT yet the chunk-based, procedurally generated,
+// seed-driven open world the medieval-fantasy brief calls for (terrain/biomes/streaming/LOD
+// are a separate, larger follow-up -- each needs its own dedicated pass with real device
+// testing rather than a single blind rewrite).
 
 data class Vec3(val x: Float, val y: Float, val z: Float)
 data class Building(val x: Float, val z: Float, val w: Float, val d: Float, val h: Float)
@@ -68,6 +73,14 @@ class World {
         )
         for (b in bList) { buildings.add(b); pushBox(b.x, b.z, b.w, b.d, b.h, Triple(0.10f, 0.09f, 0.10f)) }
 
+        // first medieval-fantasy structure: a small keep with four corner towers
+        val castle = listOf(
+            Building(0f, 140f, 14f, 14f, 10f),
+            Building(-7f, 133f, 3f, 3f, 13f), Building(7f, 133f, 3f, 3f, 13f),
+            Building(-7f, 147f, 3f, 3f, 13f), Building(7f, 147f, 3f, 3f, 13f)
+        )
+        for (b in castle) { buildings.add(b); pushBox(b.x, b.z, b.w, b.d, b.h, Triple(0.55f, 0.53f, 0.50f)) } // pale stone
+
         // deterministic pseudo-random tree scatter (no rng dependency needed)
         var seed = 0x9E3779B9.toInt()
         fun rnd(): Float {
@@ -80,7 +93,7 @@ class World {
             val x = side * (6f + rnd() * 32f)
             trees.add(Tree(x, z, 0.55f))
             pushBox(x, z, 0.35f, 0.35f, 1.1f, Triple(0.10f, 0.07f, 0.05f))
-            pushCone(x, z, 0.9f, 2.6f, 1.4f, Triple(0.03f, 0.09f, 0.04f), 7)
+            pushCone(x, z, 0.9f, 2.6f, 1.4f, Triple(0.05f, 0.20f, 0.07f), 7) // brighter green for a fantasy forest, not horror-dark
         }
     }
 

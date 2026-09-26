@@ -1,5 +1,6 @@
 package com.glyps.game
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -18,13 +19,35 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Two-pass glyph-grid renderer.
+ * Two-pass glyph-grid renderer. Architecture is unchanged from the original prototype:
  *  Pass 1 (SCENE_*):  real 3D geometry -> offscreen low-res color+depth texture.
- *  Pass 2 (GLYPH_*):  fullscreen shader samples that texture per glyph cell, picks a
- *                      glyph by brightness, samples the glyph atlas. This pass's output
- *                      IS the final image shown on screen.
+ *  Pass 2 (GLYPH_*):  fullscreen shader samples that texture per glyph cell and picks a
+ *                      glyph from the atlas. This pass's output IS the final image shown
+ *                      on screen -- the glyph grid is the actual rendering primitive, not
+ *                      a filter over a conventional 3D frame.
+ *
+ * What changed in this pass:
+ *  - glyph vocabulary: a 21-step tone ramp (space -> shade blocks) PLUS 6 "structural"
+ *    glyphs (half-blocks and diagonal quadrants) that are picked when a cell's local
+ *    brightness has clear directional structure rather than being flat. See buildAtlas()
+ *    for the full list and GLYPH_FS for the selection logic.
+ *  - glyph selection now analyzes 9 samples per cell (top/mid/bottom x left/mid/right)
+ *    instead of a single center sample, so edges/corners map to a shape-matched glyph
+ *    instead of always falling back to a brightness-only tone glyph.
+ *  - the atlas is drawn with Cascadia Mono when the bundled font asset is present
+ *    (app/src/main/assets/fonts/CascadiaMono-Regular.ttf), falling back to the device's
+ *    generic monospace font otherwise -- so this still works even if the asset is ever
+ *    removed, and the font can be swapped later without touching the rendering code.
+ *  - cell size and cell-gap are now configurable fields instead of hardcoded constants.
+ *  - day/night now drives a genuine light-fantasy (day) <-> dark-fantasy (night) palette
+ *    swap for ambient/fog/sun color, rather than a horror-toned dim-everywhere fade.
+ *
+ * Not yet done (left for a follow-up pass, each of these is a real project on its own):
+ *  chunked/streaming open-world terrain, procedural biomes, LOD, and the wider medieval
+ *  structure set (villages, ruins, bridges, caves). The world in World.kt is still the
+ *  original small fixed layout plus one added castle -- see World.kt's header comment.
  */
-class GlyphRenderer : GLSurfaceView.Renderer {
+class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     // input state, written from MainActivity's touch handling
     @Volatile var moveX = 0f
@@ -35,6 +58,12 @@ class GlyphRenderer : GLSurfaceView.Renderer {
     fun addLook(dx: Float, dy: Float) {
         synchronized(lookLock) { pendingLookDx += dx; pendingLookDy += dy }
     }
+
+    // configurable rendering knobs (phase 6 / section 23 of the brief)
+    /** <= 0 means auto-compute from screen width; set explicitly for a fixed glyph resolution. */
+    var glyphCellPx: Float = -1f
+    /** Fraction of each cell reserved as the gap between glyphs. Kept small per the brief. */
+    var gapFraction: Float = 0.08f
 
     private val world = World()
     private var camX = 0f
@@ -60,7 +89,26 @@ class GlyphRenderer : GLSurfaceView.Renderer {
 
     private val lw = 280
     private val lh = 158
-    private val glyphs = listOf(' ', '.', ':', ';', '!', 'i', 'l', '+', '*', 'x', 'o', 'O', '#', '%', '@', '\u2591', '\u2592', '\u2593', '\u2588')
+
+    // Tone ramp: sparse -> dense, used when a cell is locally flat (see GLYPH_FS).
+    private val toneGlyphs = listOf(
+        ' ', '.', '\'', ':', ';', ',', '-', '_', '~', '+', '*', 'x', 'o', 'O', '#', '%', '@',
+        '\u2591', '\u2592', '\u2593', '\u2588'
+    )
+    // Structural glyphs: their filled shape is chosen to visually match the direction of
+    // strongest local brightness change (top/bottom, left/right, or a diagonal), so a real
+    // edge or corner in the 3D scene reads as an edge/corner glyph instead of just a blob.
+    // Extend this later with quadrant/sextant/octant/Braille glyphs for finer matching --
+    // the shader only needs the extra indices and a matching branch, nothing else changes.
+    private val structureGlyphs = listOf(
+        '\u2580', // top bright (upper half block)
+        '\u2584', // bottom bright (lower half block)
+        '\u258C', // left bright
+        '\u2590', // right bright
+        '\u259A', // TL/BR diagonal bright
+        '\u259E'  // TR/BL diagonal bright
+    )
+    private val allGlyphs = toneGlyphs + structureGlyphs
     private val cellPxAtlas = 48
 
     private val proj = FloatArray(16)
@@ -102,18 +150,38 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
 
-        // real glyphs, drawn with Android's own Canvas/Paint/Typeface (no font asset needed)
-        val atlasW = glyphs.size * cellPxAtlas
+        buildGlyphAtlas()
+
+        val fsData = floatArrayOf(-1f, -1f, 0f, 0f, 3f, -1f, 2f, 0f, -1f, 3f, 0f, 2f)
+        val fb = ByteBuffer.allocateDirect(fsData.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        fb.put(fsData).position(0)
+        val fsArr = IntArray(1); GLES30.glGenBuffers(1, fsArr, 0); fsQuadVbo = fsArr[0]
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, fsQuadVbo)
+        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, fsData.size * 4, fb, GLES30.GL_STATIC_DRAW)
+
+        startTime = System.nanoTime()
+        lastFrameTime = startTime
+    }
+
+    /** Built once and reused every frame -- never regenerated per-frame (section 23/25). */
+    private fun buildGlyphAtlas() {
+        val typeface = try {
+            Typeface.createFromAsset(context.assets, "fonts/CascadiaMono-Regular.ttf")
+        } catch (e: Exception) {
+            android.util.Log.w("GlyphRenderer", "Cascadia Mono asset missing, falling back to monospace", e)
+            Typeface.MONOSPACE
+        }
+        val atlasW = allGlyphs.size * cellPxAtlas
         val atlasH = cellPxAtlas
         val bmp = Bitmap.createBitmap(atlasW, atlasH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         canvas.drawColor(Color.BLACK)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         paint.color = Color.WHITE
-        paint.typeface = Typeface.MONOSPACE
-        paint.textSize = cellPxAtlas * 0.8f
+        paint.typeface = typeface
+        paint.textSize = cellPxAtlas * 0.82f
         paint.textAlign = Paint.Align.CENTER
-        for ((i, g) in glyphs.withIndex()) {
+        for ((i, g) in allGlyphs.withIndex()) {
             val cx = i * cellPxAtlas + cellPxAtlas / 2f
             val cy = cellPxAtlas / 2f - (paint.ascent() + paint.descent()) / 2f
             canvas.drawText(g.toString(), cx, cy, paint)
@@ -126,16 +194,6 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         bmp.recycle()
-
-        val fsData = floatArrayOf(-1f, -1f, 0f, 0f, 3f, -1f, 2f, 0f, -1f, 3f, 0f, 2f)
-        val fb = ByteBuffer.allocateDirect(fsData.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-        fb.put(fsData).position(0)
-        val fsArr = IntArray(1); GLES30.glGenBuffers(1, fsArr, 0); fsQuadVbo = fsArr[0]
-        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, fsQuadVbo)
-        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, fsData.size * 4, fb, GLES30.GL_STATIC_DRAW)
-
-        startTime = System.nanoTime()
-        lastFrameTime = startTime
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -167,11 +225,14 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         if (!world.collides(camX + dx, camZ)) camX += dx
         if (!world.collides(camX, camZ + dz)) camZ += dz
 
+        // --- day/night: light-fantasy day <-> dark-fantasy night (not a black overlay) ---
         val cyc = (t / 220f) % 1f
-        val day = ((sin(cyc * (Math.PI * 2).toFloat() - (Math.PI / 2).toFloat()) + 1f) / 2f) * 0.55f
-        val ambient = floatArrayOf(0.02f + 0.05f * day, 0.03f + 0.06f * day, 0.05f + 0.08f * day)
-        val fogCol = floatArrayOf(0.02f + 0.10f * day, 0.03f + 0.11f * day, 0.06f + 0.16f * day)
-        val sunCol = floatArrayOf(0.15f * day, 0.14f * day, 0.13f * day)
+        val day = ((sin(cyc * (Math.PI * 2).toFloat() - (Math.PI / 2).toFloat()) + 1f) / 2f)
+        val ambient = mix3(AMBIENT_NIGHT, AMBIENT_DAY, day)
+        val fogCol = mix3(FOG_NIGHT, FOG_DAY, day)
+        val sunCol = mix3(SUN_NIGHT, SUN_DAY, day)
+        val fogDensity = 0.012f + (1f - day) * 0.010f
+        val lightBoost = 0.5f + (1f - day) * 0.9f // torches/lanterns read stronger at night
 
         Matrix.perspectiveM(proj, 0, 66f, screenW.toFloat() / screenH.toFloat(), 0.1f, 500f)
         val fx = sin(yaw) * cos(pitch); val fy = sin(pitch); val fz = -cos(yaw) * cos(pitch)
@@ -191,9 +252,13 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         setVec3(sceneProgram, "uSunDir", 0.4f, 0.9f, 0.3f)
         setVec3(sceneProgram, "uSunCol", sunCol[0], sunCol[1], sunCol[2])
         setVec3(sceneProgram, "uFog", fogCol[0], fogCol[1], fogCol[2])
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(sceneProgram, "uFogD"), 0.018f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(sceneProgram, "uFogD"), fogDensity)
         val lp = floatArrayOf(-3f, 3.4f, -50f, 3f, 3.4f, 10f, -3f, 3.4f, 70f)
-        val lc = floatArrayOf(1f, 0.65f, 0.25f, 1f, 0.55f, 0.2f, 0.95f, 0.7f, 0.35f)
+        val lc = floatArrayOf(
+            1f * lightBoost, 0.65f * lightBoost, 0.25f * lightBoost,
+            1f * lightBoost, 0.55f * lightBoost, 0.2f * lightBoost,
+            0.95f * lightBoost, 0.7f * lightBoost, 0.35f * lightBoost
+        )
         GLES30.glUniform3fv(GLES30.glGetUniformLocation(sceneProgram, "uLP"), 3, lp, 0)
         GLES30.glUniform3fv(GLES30.glGetUniformLocation(sceneProgram, "uLC"), 3, lc, 0)
 
@@ -206,7 +271,7 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         GLES30.glVertexAttribPointer(2, 3, GLES30.GL_FLOAT, false, 36, 24)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, sceneVertCount)
 
-        // pass 2: glyph grid -> screen (this is the final rendering primitive)
+        // pass 2: glyph grid -> screen (this pass's output IS the final rendering)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, screenW, screenH)
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
@@ -218,8 +283,11 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlasTex)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(glyphProgram, "uAtlas"), 1)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(glyphProgram, "uRes"), screenW.toFloat(), screenH.toFloat())
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), (screenW / 40).coerceIn(6, 18).toFloat())
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uGlyphN"), glyphs.size.toFloat())
+        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 40).coerceIn(6, 18).toFloat()
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), cellPx)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uToneCount"), toneGlyphs.size.toFloat())
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uAtlasCount"), allGlyphs.size.toFloat())
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uGapFrac"), gapFraction)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uTime"), t)
         setVec3(glyphProgram, "uFog", fogCol[0], fogCol[1], fogCol[2])
 
@@ -230,6 +298,10 @@ class GlyphRenderer : GLSurfaceView.Renderer {
         GLES30.glVertexAttribPointer(1, 2, GLES30.GL_FLOAT, false, 16, 8)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
     }
+
+    private fun mix3(a: FloatArray, b: FloatArray, t: Float) = floatArrayOf(
+        a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t
+    )
 
     private fun setMat4(program: Int, name: String, m: FloatArray) {
         GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, name), 1, false, m, 0)
@@ -270,6 +342,14 @@ class GlyphRenderer : GLSurfaceView.Renderer {
     }
 
     companion object {
+        // light-fantasy day palette vs dark-fantasy night palette (section 15/16 of the brief)
+        private val AMBIENT_DAY = floatArrayOf(0.34f, 0.40f, 0.46f)
+        private val AMBIENT_NIGHT = floatArrayOf(0.035f, 0.045f, 0.10f)
+        private val FOG_DAY = floatArrayOf(0.55f, 0.72f, 0.90f)
+        private val FOG_NIGHT = floatArrayOf(0.05f, 0.055f, 0.15f)
+        private val SUN_DAY = floatArrayOf(1.0f, 0.92f, 0.80f)
+        private val SUN_NIGHT = floatArrayOf(0.10f, 0.13f, 0.22f)
+
         const val SCENE_VS = """#version 300 es
             layout(location=0) in vec3 aPos;
             layout(location=1) in vec3 aNormal;
@@ -313,30 +393,81 @@ class GlyphRenderer : GLSurfaceView.Renderer {
             void main(){ vUV = aUV; gl_Position = vec4(aPos, 0.0, 1.0); }
         """
 
+        // Multi-sample, shape-aware glyph selection (section 7 of the brief):
+        // 9 samples per cell -> pick a flat tone glyph when the cell is locally uniform,
+        // otherwise pick a half-block/diagonal glyph whose filled shape matches the
+        // direction of strongest local brightness change.
         const val GLYPH_FS = """#version 300 es
             precision highp float;
             in vec2 vUV;
             uniform sampler2D uScene, uAtlas;
             uniform vec2 uRes;
-            uniform float uCellPx, uGlyphN, uTime;
+            uniform float uCellPx, uToneCount, uAtlasCount, uTime, uGapFrac;
             uniform vec3 uFog;
             out vec4 outColor;
+
+            float lum(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }
+
             void main(){
                 vec2 frag = vUV * uRes;
                 vec2 cellId = floor(frag / uCellPx);
-                vec2 sceneUV = (cellId + 0.5) * uCellPx / uRes;
-                vec3 sc = texture(uScene, sceneUV).rgb;
-                float lum = dot(sc, vec3(0.299, 0.587, 0.114));
-                float idx = floor(clamp(lum, 0.0, 0.999) * uGlyphN);
+                vec2 cellUV0 = cellId * uCellPx / uRes;
+                vec2 cellUV1 = (cellId + 1.0) * uCellPx / uRes;
+                vec2 cellSize = cellUV1 - cellUV0;
+
+                vec3 sTL = texture(uScene, cellUV0 + cellSize*vec2(0.2,0.2)).rgb;
+                vec3 sTC = texture(uScene, cellUV0 + cellSize*vec2(0.5,0.2)).rgb;
+                vec3 sTR = texture(uScene, cellUV0 + cellSize*vec2(0.8,0.2)).rgb;
+                vec3 sML = texture(uScene, cellUV0 + cellSize*vec2(0.2,0.5)).rgb;
+                vec3 sC  = texture(uScene, cellUV0 + cellSize*vec2(0.5,0.5)).rgb;
+                vec3 sMR = texture(uScene, cellUV0 + cellSize*vec2(0.8,0.5)).rgb;
+                vec3 sBL = texture(uScene, cellUV0 + cellSize*vec2(0.2,0.8)).rgb;
+                vec3 sBC = texture(uScene, cellUV0 + cellSize*vec2(0.5,0.8)).rgb;
+                vec3 sBR = texture(uScene, cellUV0 + cellSize*vec2(0.8,0.8)).rgb;
+
+                vec3 avgColor = (sTL+sTC+sTR+sML+sC+sMR+sBL+sBC+sBR) / 9.0;
+                float lTL=lum(sTL), lTC=lum(sTC), lTR=lum(sTR), lML=lum(sML), lC=lum(sC);
+                float lMR=lum(sMR), lBL=lum(sBL), lBC=lum(sBC), lBR=lum(sBR);
+
+                float top = (lTL+lTC+lTR)/3.0;
+                float bottom = (lBL+lBC+lBR)/3.0;
+                float left = (lTL+lML+lBL)/3.0;
+                float right = (lTR+lMR+lBR)/3.0;
+                float diagA = (lTL+lBR)/2.0;
+                float diagB = (lTR+lBL)/2.0;
+
+                float mn = lTL; mn = min(mn, lTC); mn = min(mn, lTR); mn = min(mn, lML);
+                mn = min(mn, lC); mn = min(mn, lMR); mn = min(mn, lBL); mn = min(mn, lBC); mn = min(mn, lBR);
+                float mx = lTL; mx = max(mx, lTC); mx = max(mx, lTR); mx = max(mx, lML);
+                mx = max(mx, lC); mx = max(mx, lMR); mx = max(mx, lBL); mx = max(mx, lBC); mx = max(mx, lBR);
+                float variance = mx - mn;
+
+                float hDiff = top - bottom;
+                float vDiff = left - right;
+                float dDiff = diagA - diagB;
+                float ah = abs(hDiff), av = abs(vDiff), ad = abs(dDiff);
+
+                float glyphIdx;
+                float structureThreshold = 0.16;
+                if (variance < structureThreshold) {
+                    glyphIdx = floor(clamp(lC, 0.0, 0.999) * uToneCount);
+                } else if (ah >= av && ah >= ad) {
+                    glyphIdx = uToneCount + (hDiff > 0.0 ? 0.0 : 1.0);
+                } else if (av >= ah && av >= ad) {
+                    glyphIdx = uToneCount + (vDiff > 0.0 ? 2.0 : 3.0);
+                } else {
+                    glyphIdx = uToneCount + (dDiff > 0.0 ? 4.0 : 5.0);
+                }
+
                 vec2 local = fract(frag / uCellPx);
-                float gap = 0.10;
+                float gap = uGapFrac;
                 vec3 col;
                 if (local.x < gap || local.x > 1.0-gap || local.y < gap || local.y > 1.0-gap) {
                     col = uFog * 0.35;
                 } else {
                     vec2 inner = (local - gap) / (1.0 - 2.0*gap);
-                    float mask = texture(uAtlas, vec2((idx+inner.x)/uGlyphN, inner.y)).r;
-                    col = mix(uFog*0.35, sc*1.5, mask);
+                    float mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
+                    col = mix(uFog*0.35, avgColor*1.5, mask);
                 }
                 col *= 0.9 + 0.1*sin(frag.y*3.14159265);
                 vec2 c = vUV - 0.5;
