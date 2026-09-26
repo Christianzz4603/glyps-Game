@@ -46,7 +46,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     var glyphCellPx: Float = -1f
-    var gapFraction: Float = 0.018f
+    var gapFraction: Float = 0.006f
 
     private val world = World()
     private var camX = 0f
@@ -251,14 +251,12 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlasTex)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(glyphProgram, "uAtlas"), 1)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(glyphProgram, "uRes"), screenW.toFloat(), screenH.toFloat())
-        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 70).coerceIn(4, 9).toFloat()
+        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 100).coerceIn(3, 7).toFloat()
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), cellPx)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uToneCount"), toneGlyphs.size.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uAtlasCount"), allGlyphs.size.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uGapFrac"), gapFraction)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uTime"), t)
-        setVec3(glyphProgram, "uFog", fogCol[0], fogCol[1], fogCol[2])
-
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, fsQuadVbo)
         GLES30.glEnableVertexAttribArray(0)
         GLES30.glEnableVertexAttribArray(1)
@@ -367,7 +365,6 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
             uniform sampler2D uScene, uAtlas;
             uniform vec2 uRes;
             uniform float uCellPx, uToneCount, uAtlasCount, uTime, uGapFrac;
-            uniform vec3 uFog;
             out vec4 outColor;
 
             float lum(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -423,20 +420,28 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
                     glyphIdx = uToneCount + (dDiff > 0.0 ? 4.0 : 5.0);
                 }
 
+                // Background/gap pixels are tinted from the scene's OWN average color
+                // (already correctly fog-blended by distance in the 3D pass), not a flat
+                // neutral fog tone -- otherwise anything dimmer than sunlit grass (which
+                // always picks a dense, high-ink glyph) mostly shows as gray/blank instead
+                // of its real hue.
+                vec3 bg = avgColor * 0.55;
+                vec3 ink = avgColor * 1.6;
+
                 vec2 local = fract(frag / uCellPx);
                 float gap = uGapFrac;
                 vec3 col;
                 if (local.x < gap || local.x > 1.0-gap || local.y < gap || local.y > 1.0-gap) {
-                    col = uFog * 0.55;
+                    col = bg;
                 } else {
                     vec2 inner = (local - gap) / (1.0 - 2.0*gap);
                     float mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
-                    col = mix(uFog*0.55, avgColor*1.7, mask);
+                    col = mix(bg, ink, mask);
                 }
-                col *= 0.92 + 0.08*sin(frag.y*3.14159265);
+                col *= 0.94 + 0.06*sin(frag.y*3.14159265);
                 vec2 c = vUV - 0.5;
-                col *= 1.0 - dot(c,c)*0.40;
-                col *= 0.97 + 0.03*sin(uTime*23.0 + frag.x*0.01);
+                col *= 1.0 - dot(c,c)*0.30;
+                col *= 0.98 + 0.02*sin(uTime*23.0 + frag.x*0.01);
                 outColor = vec4(col, 1.0);
             }
         """
