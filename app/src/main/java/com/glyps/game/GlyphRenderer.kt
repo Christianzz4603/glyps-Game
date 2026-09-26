@@ -19,33 +19,19 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Two-pass glyph-grid renderer. Architecture is unchanged from the original prototype:
+ * Two-pass glyph-grid renderer. Architecture unchanged:
  *  Pass 1 (SCENE_*):  real 3D geometry -> offscreen low-res color+depth texture.
  *  Pass 2 (GLYPH_*):  fullscreen shader samples that texture per glyph cell and picks a
  *                      glyph from the atlas. This pass's output IS the final image shown
- *                      on screen -- the glyph grid is the actual rendering primitive, not
- *                      a filter over a conventional 3D frame.
+ *                      on screen.
  *
- * What changed in this pass:
- *  - glyph vocabulary: a 21-step tone ramp (space -> shade blocks) PLUS 6 "structural"
- *    glyphs (half-blocks and diagonal quadrants) that are picked when a cell's local
- *    brightness has clear directional structure rather than being flat. See buildAtlas()
- *    for the full list and GLYPH_FS for the selection logic.
- *  - glyph selection now analyzes 9 samples per cell (top/mid/bottom x left/mid/right)
- *    instead of a single center sample, so edges/corners map to a shape-matched glyph
- *    instead of always falling back to a brightness-only tone glyph.
- *  - the atlas is drawn with Cascadia Mono when the bundled font asset is present
- *    (app/src/main/assets/fonts/CascadiaMono-Regular.ttf), falling back to the device's
- *    generic monospace font otherwise -- so this still works even if the asset is ever
- *    removed, and the font can be swapped later without touching the rendering code.
- *  - cell size and cell-gap are now configurable fields instead of hardcoded constants.
- *  - day/night now drives a genuine light-fantasy (day) <-> dark-fantasy (night) palette
- *    swap for ambient/fog/sun color, rather than a horror-toned dim-everywhere fade.
- *
- * Not yet done (left for a follow-up pass, each of these is a real project on its own):
- *  chunked/streaming open-world terrain, procedural biomes, LOD, and the wider medieval
- *  structure set (villages, ruins, bridges, caves). The world in World.kt is still the
- *  original small fixed layout plus one added castle -- see World.kt's header comment.
+ * This revision specifically fixes a "looks pure black" report:
+ *  - night previously crushed ambient/fog toward (0.03-0.05, 0.15) -- dark fantasy, but
+ *    unreadable on a phone screen. Raised the night floor so shapes stay visible.
+ *  - the glyph-cell gap and vignette darkening multipliers were tuned for a horror scene
+ *    and were too aggressive for a colorful fantasy one; loosened both.
+ *  - camera eye height now follows World.heightAt(x,z) so the new hilly terrain doesn't
+ *    make the player appear to float or clip into the ground.
  */
 class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
@@ -59,16 +45,14 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         synchronized(lookLock) { pendingLookDx += dx; pendingLookDy += dy }
     }
 
-    // configurable rendering knobs (phase 6 / section 23 of the brief)
-    /** <= 0 means auto-compute from screen width; set explicitly for a fixed glyph resolution. */
     var glyphCellPx: Float = -1f
-    /** Fraction of each cell reserved as the gap between glyphs. Kept small per the brief. */
     var gapFraction: Float = 0.08f
 
     private val world = World()
     private var camX = 0f
-    private var camY = 1.7f
     private var camZ = -30f
+    private var camY = 1.7f
+    private val eyeHeight = 1.7f
     private var yaw = 0.4f
     private var pitch = 0f
 
@@ -90,24 +74,11 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private val lw = 280
     private val lh = 158
 
-    // Tone ramp: sparse -> dense, used when a cell is locally flat (see GLYPH_FS).
     private val toneGlyphs = listOf(
         ' ', '.', '\'', ':', ';', ',', '-', '_', '~', '+', '*', 'x', 'o', 'O', '#', '%', '@',
         '\u2591', '\u2592', '\u2593', '\u2588'
     )
-    // Structural glyphs: their filled shape is chosen to visually match the direction of
-    // strongest local brightness change (top/bottom, left/right, or a diagonal), so a real
-    // edge or corner in the 3D scene reads as an edge/corner glyph instead of just a blob.
-    // Extend this later with quadrant/sextant/octant/Braille glyphs for finer matching --
-    // the shader only needs the extra indices and a matching branch, nothing else changes.
-    private val structureGlyphs = listOf(
-        '\u2580', // top bright (upper half block)
-        '\u2584', // bottom bright (lower half block)
-        '\u258C', // left bright
-        '\u2590', // right bright
-        '\u259A', // TL/BR diagonal bright
-        '\u259E'  // TR/BL diagonal bright
-    )
+    private val structureGlyphs = listOf('\u2580', '\u2584', '\u258C', '\u2590', '\u259A', '\u259E')
     private val allGlyphs = toneGlyphs + structureGlyphs
     private val cellPxAtlas = 48
 
@@ -163,7 +134,6 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         lastFrameTime = startTime
     }
 
-    /** Built once and reused every frame -- never regenerated per-frame (section 23/25). */
     private fun buildGlyphAtlas() {
         val typeface = try {
             Typeface.createFromAsset(context.assets, "fonts/CascadiaMono-Regular.ttf")
@@ -224,21 +194,20 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val dz = (rightZ * mx / len + fwdZ * mz / len) * speed * dt
         if (!world.collides(camX + dx, camZ)) camX += dx
         if (!world.collides(camX, camZ + dz)) camZ += dz
+        camY = world.heightAt(camX, camZ) + eyeHeight // follow the new hilly terrain
 
-        // --- day/night: light-fantasy day <-> dark-fantasy night (not a black overlay) ---
         val cyc = (t / 220f) % 1f
         val day = ((sin(cyc * (Math.PI * 2).toFloat() - (Math.PI / 2).toFloat()) + 1f) / 2f)
         val ambient = mix3(AMBIENT_NIGHT, AMBIENT_DAY, day)
         val fogCol = mix3(FOG_NIGHT, FOG_DAY, day)
         val sunCol = mix3(SUN_NIGHT, SUN_DAY, day)
-        val fogDensity = 0.012f + (1f - day) * 0.010f
-        val lightBoost = 0.5f + (1f - day) * 0.9f // torches/lanterns read stronger at night
+        val fogDensity = 0.010f + (1f - day) * 0.008f
+        val lightBoost = 0.5f + (1f - day) * 0.9f
 
         Matrix.perspectiveM(proj, 0, 66f, screenW.toFloat() / screenH.toFloat(), 0.1f, 500f)
         val fx = sin(yaw) * cos(pitch); val fy = sin(pitch); val fz = -cos(yaw) * cos(pitch)
         Matrix.setLookAtM(view, 0, camX, camY, camZ, camX + fx, camY + fy, camZ + fz, 0f, 1f, 0f)
 
-        // pass 1: 3D scene -> offscreen texture
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, sceneFbo)
         GLES30.glViewport(0, 0, lw, lh)
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
@@ -271,7 +240,6 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glVertexAttribPointer(2, 3, GLES30.GL_FLOAT, false, 36, 24)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, sceneVertCount)
 
-        // pass 2: glyph grid -> screen (this pass's output IS the final rendering)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, screenW, screenH)
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
@@ -342,13 +310,13 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     companion object {
-        // light-fantasy day palette vs dark-fantasy night palette (section 15/16 of the brief)
-        private val AMBIENT_DAY = floatArrayOf(0.34f, 0.40f, 0.46f)
-        private val AMBIENT_NIGHT = floatArrayOf(0.035f, 0.045f, 0.10f)
+        // raised from the first pass: dark fantasy at night, but never crushed to black
+        private val AMBIENT_DAY = floatArrayOf(0.36f, 0.42f, 0.48f)
+        private val AMBIENT_NIGHT = floatArrayOf(0.11f, 0.12f, 0.20f)
         private val FOG_DAY = floatArrayOf(0.55f, 0.72f, 0.90f)
-        private val FOG_NIGHT = floatArrayOf(0.05f, 0.055f, 0.15f)
+        private val FOG_NIGHT = floatArrayOf(0.12f, 0.13f, 0.24f)
         private val SUN_DAY = floatArrayOf(1.0f, 0.92f, 0.80f)
-        private val SUN_NIGHT = floatArrayOf(0.10f, 0.13f, 0.22f)
+        private val SUN_NIGHT = floatArrayOf(0.16f, 0.19f, 0.30f)
 
         const val SCENE_VS = """#version 300 es
             layout(location=0) in vec3 aPos;
@@ -393,10 +361,6 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
             void main(){ vUV = aUV; gl_Position = vec4(aPos, 0.0, 1.0); }
         """
 
-        // Multi-sample, shape-aware glyph selection (section 7 of the brief):
-        // 9 samples per cell -> pick a flat tone glyph when the cell is locally uniform,
-        // otherwise pick a half-block/diagonal glyph whose filled shape matches the
-        // direction of strongest local brightness change.
         const val GLYPH_FS = """#version 300 es
             precision highp float;
             in vec2 vUV;
@@ -463,16 +427,16 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 float gap = uGapFrac;
                 vec3 col;
                 if (local.x < gap || local.x > 1.0-gap || local.y < gap || local.y > 1.0-gap) {
-                    col = uFog * 0.35;
+                    col = uFog * 0.55;
                 } else {
                     vec2 inner = (local - gap) / (1.0 - 2.0*gap);
                     float mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
-                    col = mix(uFog*0.35, avgColor*1.5, mask);
+                    col = mix(uFog*0.55, avgColor*1.7, mask);
                 }
-                col *= 0.9 + 0.1*sin(frag.y*3.14159265);
+                col *= 0.92 + 0.08*sin(frag.y*3.14159265);
                 vec2 c = vUV - 0.5;
-                col *= 1.0 - dot(c,c)*0.55;
-                col *= 0.965 + 0.035*sin(uTime*23.0 + frag.x*0.01);
+                col *= 1.0 - dot(c,c)*0.40;
+                col *= 0.97 + 0.03*sin(uTime*23.0 + frag.x*0.01);
                 outColor = vec4(col, 1.0);
             }
         """
