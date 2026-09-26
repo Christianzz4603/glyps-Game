@@ -46,7 +46,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     var glyphCellPx: Float = -1f
-    var gapFraction: Float = 0.08f
+    var gapFraction: Float = 0.03f
 
     private val world = World()
     private var camX = 0f
@@ -197,7 +197,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         camY = world.heightAt(camX, camZ) + eyeHeight // follow the new hilly terrain
 
         val cyc = (t / 220f) % 1f
-        val day = ((sin(cyc * (Math.PI * 2).toFloat() - (Math.PI / 2).toFloat()) + 1f) / 2f)
+        val day = ((cos(cyc * (Math.PI * 2).toFloat()) + 1f) / 2f) // starts at full daylight (day=1) at t=0
         val ambient = mix3(AMBIENT_NIGHT, AMBIENT_DAY, day)
         val fogCol = mix3(FOG_NIGHT, FOG_DAY, day)
         val sunCol = mix3(SUN_NIGHT, SUN_DAY, day)
@@ -251,7 +251,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlasTex)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(glyphProgram, "uAtlas"), 1)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(glyphProgram, "uRes"), screenW.toFloat(), screenH.toFloat())
-        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 40).coerceIn(6, 18).toFloat()
+        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 55).coerceIn(5, 14).toFloat()
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), cellPx)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uToneCount"), toneGlyphs.size.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uAtlasCount"), allGlyphs.size.toFloat())
