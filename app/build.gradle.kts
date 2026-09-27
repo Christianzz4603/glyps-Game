@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "com.glyps.game"
-    compileSdk = 34
+    compileSdk = 33
 
     defaultConfig {
         applicationId = "com.glyps.game"
         minSdk = 30
-        targetSdk = 34
+        targetSdk = 33
         versionCode = 1
         versionName = "0.1.0"
     }

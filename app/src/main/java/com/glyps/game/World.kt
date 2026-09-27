@@ -94,6 +94,45 @@ class World {
         pushCone(cx, cz, heightAt(cx, cz) + 0.02f, 0f, radius, SHADOW_COL, 10)
     }
 
+    /** A truncated cone (bottom radius r0, top radius r1) -- used for round towers,
+     *  the windmill, and the well, none of which taper all the way to a point. */
+    private fun pushFrustum(cx: Float, cz: Float, y0: Float, h: Float, r0: Float, r1: Float, col: Triple<Float, Float, Float>, seg: Int, angleOffset: Float = 0f) {
+        for (i in 0 until seg) {
+            val a0 = angleOffset + i.toFloat() / seg * (PI * 2).toFloat()
+            val a1 = angleOffset + (i + 1).toFloat() / seg * (PI * 2).toFloat()
+            val p0b = Vec3(cx + cos(a0) * r0, y0, cz + sin(a0) * r0)
+            val p1b = Vec3(cx + cos(a1) * r0, y0, cz + sin(a1) * r0)
+            val p0t = Vec3(cx + cos(a0) * r1, y0 + h, cz + sin(a0) * r1)
+            val p1t = Vec3(cx + cos(a1) * r1, y0 + h, cz + sin(a1) * r1)
+            pushQuad(p0b, p1b, p1t, p0t, col)
+        }
+    }
+    /** A ring of small merlon boxes along the top of a wall/tower for a real castle
+     *  battlement look, instead of a plain flat-topped wall. */
+    private fun pushCrenellations(cx: Float, cz: Float, length: Float, topY: Float, col: Triple<Float, Float, Float>, alongX: Boolean) {
+        val merlon = 0.85f; val spacing = 1.7f
+        val count = (length / spacing).toInt().coerceAtLeast(1)
+        val start = -length / 2f + spacing / 2f
+        for (i in 0 until count) {
+            val off = start + i * spacing
+            val mx = if (alongX) cx + off else cx
+            val mz = if (alongX) cz else cz + off
+            pushBox(mx, mz, merlon, merlon, merlon, topY, col)
+        }
+    }
+    /** Thin dark "exposed beam" boxes overlaid on a wall face for a half-timbered
+     *  (Tudor-style) look -- offset slightly proud of the wall to avoid z-fighting. */
+    private fun pushTimberAccent(cx: Float, faceZ: Float, wallW: Float, y0: Float, y1: Float, faceSign: Float) {
+        val beamCol = Triple(0.14f, 0.09f, 0.05f)
+        val zz = faceZ + 0.03f * faceSign
+        val t = 0.10f
+        pushQuad(Vec3(cx - wallW * 0.28f, y0, zz), Vec3(cx - wallW * 0.28f + t, y0, zz), Vec3(cx - wallW * 0.28f + t, y1, zz), Vec3(cx - wallW * 0.28f, y1, zz), beamCol)
+        pushQuad(Vec3(cx + wallW * 0.28f, y0, zz), Vec3(cx + wallW * 0.28f + t, y0, zz), Vec3(cx + wallW * 0.28f + t, y1, zz), Vec3(cx + wallW * 0.28f, y1, zz), beamCol)
+        val midY = (y0 + y1) / 2f
+        pushQuad(Vec3(cx - wallW * 0.28f, y0, zz), Vec3(cx - wallW * 0.28f + t, y0, zz), Vec3(cx + wallW * 0.20f + t, midY, zz), Vec3(cx + wallW * 0.20f, midY, zz), beamCol)
+        pushQuad(Vec3(cx + wallW * 0.20f, midY, zz), Vec3(cx + wallW * 0.20f + t, midY, zz), Vec3(cx - wallW * 0.28f + t, y1, zz), Vec3(cx - wallW * 0.28f, y1, zz), beamCol)
+    }
+
     private val MOUNTAINS = listOf(
         Mountain(-170f, -160f, 65f, 32f),
         Mountain(160f, 175f, 60f, 28f),
@@ -191,6 +230,8 @@ class World {
         pushBox(0f, bridgeZ, 8f, 11f, 0.6f, bridgeY, bridgeStone)
         pushBox(0f, bridgeZ - 5f, 8.5f, 0.6f, 0.5f, bridgeY + 0.6f, bridgeStone)
         pushBox(0f, bridgeZ + 5f, 8.5f, 0.6f, 0.5f, bridgeY + 0.6f, bridgeStone)
+        pushBox(0f, bridgeZ - 5.3f, 8.6f, 1.0f, 1.2f, heightAt(0f, bridgeZ - 6.3f), bridgeStone)
+        pushBox(0f, bridgeZ + 5.3f, 8.6f, 1.0f, 1.2f, heightAt(0f, bridgeZ + 6.3f), bridgeStone)
     }
 
     fun bridgeHeightIfOn(x: Float, z: Float): Float? =
@@ -201,7 +242,7 @@ class World {
      *  chimney. Collision is 5 thin wall-strip rectangles (split around the door) added
      *  to the existing `buildings` AABB list -- reuses the existing collision code
      *  exactly, no new logic, and the door gap is simply where no strip exists. */
-    private fun buildDetailedHouse(cx: Float, cz: Float, w: Float, d: Float, wallH: Float, wallCol: Triple<Float, Float, Float>, roofCol: Triple<Float, Float, Float>) {
+    private fun buildDetailedHouse(cx: Float, cz: Float, w: Float, d: Float, wallH: Float, wallCol: Triple<Float, Float, Float>, roofCol: Triple<Float, Float, Float>, timberAccent: Boolean = false) {
         val by = heightAt(cx, cz)
         val x0 = cx - w / 2; val x1 = cx + w / 2; val z0 = cz - d / 2; val z1 = cz + d / 2
         val y0 = by; val y1 = by + wallH
@@ -258,6 +299,8 @@ class World {
         val chimX = cx + w * 0.22f
         pushBox(chimX, z0 + d * 0.18f, 0.5f, 0.5f, roofH * 0.9f + 0.6f, y1, Triple(0.42f, 0.40f, 0.38f))
 
+        if (timberAccent) pushTimberAccent(cx, z1, w, y0, y1, 1f)
+
         pushShadowBlob(cx, cz, sqrt(w * w + d * d) / 2f * 1.25f)
     }
 
@@ -302,7 +345,7 @@ class World {
         for ((i, entry) in bList.withIndex()) {
             val (cx, cz, dims) = entry
             val (w, d, h) = dims
-            buildDetailedHouse(cx, cz, w, d, h, houseColors[i], Triple(0.60f, 0.22f, 0.15f))
+            buildDetailedHouse(cx, cz, w, d, h, houseColors[i], Triple(0.60f, 0.22f, 0.15f), timberAccent = (i == 1 || i == 3))
         }
 
         val cottages = listOf(
@@ -340,6 +383,10 @@ class World {
         buildings.add(Building(0f, 147f, 14f, 1.2f, curtainH)); pushBox(0f, 147f, 14f, 1.2f, curtainH, curtainY, stoneCol)
         buildings.add(Building(-7f, 140f, 1.2f, 14f, curtainH)); pushBox(-7f, 140f, 1.2f, 14f, curtainH, curtainY, stoneCol)
         buildings.add(Building(7f, 140f, 1.2f, 14f, curtainH)); pushBox(7f, 140f, 1.2f, 14f, curtainH, curtainY, stoneCol)
+        pushCrenellations(0f, 133f, 14f, curtainY + curtainH, stoneCol, true)
+        pushCrenellations(0f, 147f, 14f, curtainY + curtainH, stoneCol, true)
+        pushCrenellations(-7f, 140f, 14f, curtainY + curtainH, stoneCol, false)
+        pushCrenellations(7f, 140f, 14f, curtainY + curtainH, stoneCol, false)
 
         val ruinStoneCol = Triple(0.40f, 0.42f, 0.34f)
         val ruinSegs = listOf(
@@ -349,6 +396,54 @@ class World {
             buildings.add(Building(rx, rz, 2.2f, 2.2f, rh))
             pushBox(rx, rz, 2.2f, 2.2f, rh, heightAt(rx, rz), ruinStoneCol)
             pushShadowBlob(rx, rz, 1.8f)
+        }
+
+        // windmill: tapered stone frustum tower, wooden cap, four crossed sail blades
+        run {
+            val wx = -25f; val wz = -60f
+            val wy = heightAt(wx, wz)
+            pushFrustum(wx, wz, wy, 7f, 2.2f, 1.3f, Triple(0.50f, 0.46f, 0.40f), 10)
+            pushCone(wx, wz, wy + 7f, 1.6f, 1.5f, Triple(0.30f, 0.20f, 0.12f), 10)
+            val hubY = wy + 6.2f; val hubZ = wz + 1.5f
+            val bladeLen = 4.0f; val bladeW = 0.35f
+            val bladeCol = Triple(0.32f, 0.22f, 0.12f)
+            for (k in 0 until 4) {
+                val ang = (PI / 4).toFloat() + k * (PI / 2).toFloat()
+                val dirX = cos(ang); val dirY = sin(ang)
+                val perpX = -sin(ang); val perpY = cos(ang)
+                val tx = wx + dirX * bladeLen; val ty = hubY + dirY * bladeLen
+                pushQuad(
+                    Vec3(wx - perpX * bladeW, hubY - perpY * bladeW, hubZ), Vec3(wx + perpX * bladeW, hubY + perpY * bladeW, hubZ),
+                    Vec3(tx + perpX * bladeW * 0.3f, ty + perpY * bladeW * 0.3f, hubZ), Vec3(tx - perpX * bladeW * 0.3f, ty - perpY * bladeW * 0.3f, hubZ),
+                    bladeCol
+                )
+            }
+            buildings.add(Building(wx, wz, 4.4f, 4.4f, 8.6f))
+            pushShadowBlob(wx, wz, 3.0f)
+        }
+
+        // village well: small stone ring, two posts, a tiny peaked roof
+        run {
+            val wx = 2f; val wz = 0f
+            val wy = heightAt(wx, wz)
+            pushFrustum(wx, wz, wy, 1.0f, 1.0f, 1.0f, Triple(0.50f, 0.48f, 0.44f), 10)
+            pushBox(wx - 0.8f, wz, 0.18f, 0.18f, 1.9f, wy, Triple(0.28f, 0.18f, 0.10f))
+            pushBox(wx + 0.8f, wz, 0.18f, 0.18f, 1.9f, wy, Triple(0.28f, 0.18f, 0.10f))
+            pushCone(wx, wz, wy + 1.9f, 1.0f, 1.3f, Triple(0.42f, 0.16f, 0.12f), 4, (PI / 4).toFloat())
+            buildings.add(Building(wx, wz, 2.0f, 2.0f, 1.0f))
+            pushShadowBlob(wx, wz, 1.6f)
+        }
+
+        // guard tower: freestanding round watchtower along the road, with battlements
+        run {
+            val tx = -10f; val tz = -70f
+            val ty = heightAt(tx, tz)
+            val towerH = 9f
+            pushFrustum(tx, tz, ty, towerH, 1.8f, 1.5f, Triple(0.56f, 0.54f, 0.50f), 10)
+            pushCrenellations(tx, tz, 9.4f, ty + towerH, Triple(0.56f, 0.54f, 0.50f), true)
+            pushCrenellations(tx, tz, 9.4f, ty + towerH, Triple(0.56f, 0.54f, 0.50f), false)
+            buildings.add(Building(tx, tz, 3.6f, 3.6f, towerH))
+            pushShadowBlob(tx, tz, 2.6f)
         }
 
         var seed = 0x9E3779B9.toInt()
