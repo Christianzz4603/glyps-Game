@@ -46,7 +46,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     var glyphCellPx: Float = -1f
-    var gapFraction: Float = 0.00001f
+    var gapFraction: Float = 0f
 
     private val world = World()
     private var camX = 0f
@@ -81,6 +81,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         '?', ']', '[', '}', '{', '1', ')', '(', '|', '/', 't', 'f', 'j', 'r', 'x', 'n', 'u', 'v', 'c', 'z',
         'X', 'Y', 'U', 'J', 'C', 'L', 'Q', '0', 'O', 'Z', 'm', 'w', 'q', 'p', 'd', 'b', 'k', 'h', 'a', 'o',
         '*', '#', 'M', 'W', '&', '8', '%', 'B', '@', '$',
+        '\u25E6', '\u25CB', '\u25AA', '\u25CF', '\u2596', '\u2597', '\u2598', '\u259D',
         '\u2591', '\u2592', '\u2593', '\u2588'
     )
     private val structureGlyphs = listOf('\u2580', '\u2584', '\u258C', '\u2590', '\u259A', '\u259E')
@@ -256,7 +257,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlasTex)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(glyphProgram, "uAtlas"), 1)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(glyphProgram, "uRes"), screenW.toFloat(), screenH.toFloat())
-        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 100).coerceIn(3, 7).toFloat()
+        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 140).coerceIn(2, 5).toFloat()
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), cellPx)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uToneCount"), toneGlyphs.size.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uAtlasCount"), allGlyphs.size.toFloat())
