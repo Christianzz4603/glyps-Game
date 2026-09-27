@@ -46,7 +46,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     var glyphCellPx: Float = -1f
-    var gapFraction: Float = 0.0025f
+    var gapFraction: Float = 0.00001f
 
     private val world = World()
     private var camX = 0f
@@ -74,8 +74,13 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private val lw = 280
     private val lh = 158
 
+    // A much larger, finer sparse->dense density ramp (70 characters) for smoother
+    // gradation, plus the 4 shade blocks, before the 6 structural glyphs below.
     private val toneGlyphs = listOf(
-        ' ', '.', '\'', ':', ';', ',', '-', '_', '~', '+', '*', 'x', 'o', 'O', '#', '%', '@',
+        ' ', '.', '\'', '\\', '`', '^', '"', ',', ':', ';', 'I', 'l', '!', 'i', '>', '<', '~', '+', '_', '-',
+        '?', ']', '[', '}', '{', '1', ')', '(', '|', '/', 't', 'f', 'j', 'r', 'x', 'n', 'u', 'v', 'c', 'z',
+        'X', 'Y', 'U', 'J', 'C', 'L', 'Q', '0', 'O', 'Z', 'm', 'w', 'q', 'p', 'd', 'b', 'k', 'h', 'a', 'o',
+        '*', '#', 'M', 'W', '&', '8', '%', 'B', '@', '$',
         '\u2591', '\u2592', '\u2593', '\u2588'
     )
     private val structureGlyphs = listOf('\u2580', '\u2584', '\u258C', '\u2590', '\u259A', '\u259E')
