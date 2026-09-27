@@ -46,7 +46,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     var glyphCellPx: Float = -1f
-    var gapFraction: Float = 0.006f
+    var gapFraction: Float = 0.0025f
 
     private val world = World()
     private var camX = 0f

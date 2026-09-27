@@ -8,10 +8,10 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 // world/scene geometry for a small medieval realm: mountains with rock/snow coloring,
-// rolling fields, a winding river (blocks wading except at its bridge), a village, a
-// castle with turrets, a set of ruins, and both scattered and dense forest -- still one
-// fixed, hand-placed layout (not chunked/streamed/seed-generated yet, see the note at
-// the end of this file for what's still a separate follow-up).
+// rolling fields, a real carved river valley crossed by a stone bridge, a village, a
+// walled castle with turrets, ruins, and both scattered and dense tall forest -- ground
+// contact shadows under every object. Still one fixed, hand-placed layout (not
+// chunked/streamed/seed-generated), see the note at the end of this file.
 
 data class Vec3(val x: Float, val y: Float, val z: Float)
 data class Building(val x: Float, val z: Float, val w: Float, val d: Float, val h: Float)
@@ -19,7 +19,6 @@ data class Tree(val x: Float, val z: Float, val r: Float)
 private data class Mountain(val x: Float, val z: Float, val radius: Float, val peak: Float)
 
 class World {
-    // interleaved pos3, normal3, color3 per vertex
     val vertices = ArrayList<Float>()
     val buildings = ArrayList<Building>()
     val trees = ArrayList<Tree>()
@@ -76,14 +75,17 @@ class World {
             )
         }
     }
+    private val SHADOW_COL = Triple(0.045f, 0.06f, 0.045f)
+    private fun pushShadowBlob(cx: Float, cz: Float, radius: Float) {
+        pushCone(cx, cz, heightAt(cx, cz) + 0.02f, 0f, radius, SHADOW_COL, 10)
+    }
 
-    // --- terrain: rolling hills plus a few gaussian mountain bumps ---
     private val MOUNTAINS = listOf(
         Mountain(-170f, -160f, 65f, 32f),
         Mountain(160f, 175f, 60f, 28f),
         Mountain(90f, 195f, 50f, 16f)
     )
-    fun heightAt(x: Float, z: Float): Float {
+    private fun baseHeightAt(x: Float, z: Float): Float {
         var h = 0.9f * sin(x * 0.035f) * cos(z * 0.045f) + 0.4f * sin(x * 0.09f + 1.3f) * cos(z * 0.07f + 0.6f)
         for (m in MOUNTAINS) {
             val dx = x - m.x; val dz = z - m.z
@@ -93,7 +95,19 @@ class World {
         return h
     }
 
-    /** Grass/farmland at low elevation, blending to bare rock then snow on the mountains. */
+    private val RIVER_BASE_Z = 45f
+    private val RIVER_HALF_W = 3.5f
+    private val BRIDGE_X_HALF = 4.5f
+    private val BRIDGE_Z_HALF = 6.0f
+    private fun riverZAt(x: Float): Float = RIVER_BASE_Z + sin(x * 0.02f) * 15f
+
+    fun heightAt(x: Float, z: Float): Float {
+        val h = baseHeightAt(x, z)
+        val distToRiver = abs(z - riverZAt(x))
+        val dipT = (1f - (distToRiver / 7f).coerceIn(0f, 1f))
+        return h - dipT * dipT * 1.3f
+    }
+
     private fun terrainColor(x: Float, z: Float, h: Float): Triple<Float, Float, Float> {
         val patch = sin(x * 0.02f) * cos(z * 0.025f) + sin(x * 0.006f + 2f) * cos(z * 0.014f + 1f)
         val green = ((patch + 1.4f) / 2.8f).coerceIn(0f, 1f)
@@ -129,7 +143,7 @@ class World {
 
     private fun buildRoad() {
         val half = 300f; val step = 10f; val halfWidth = 4f
-        val col = Triple(0.48f, 0.40f, 0.28f) // warm packed dirt/stone
+        val col = Triple(0.48f, 0.40f, 0.28f)
         var z = -half
         while (z < half) {
             val z0 = z; val z1 = z + step
@@ -140,33 +154,29 @@ class World {
         }
     }
 
-    // --- river: winds across the map, crossed once by a stone bridge on the road ---
-    private val RIVER_BASE_Z = 45f
-    private val RIVER_HALF_W = 3.5f
-    private val BRIDGE_X_HALF = 4.5f
-    private val BRIDGE_Z_HALF = 6.0f
-    private fun riverZAt(x: Float): Float = RIVER_BASE_Z + sin(x * 0.02f) * 15f
     private val bridgeZ = riverZAt(0f)
-    private val bridgeY = heightAt(0f, bridgeZ) + 0.3f
+    private val bridgeY = baseHeightAt(0f, bridgeZ) + 0.35f
 
     private fun buildRiverAndBridge() {
         val steps = 60
         val xStart = -200f; val xEnd = 200f
-        val riverColor = Triple(0.15f, 0.48f, 0.66f) // vivid, sky-reflecting blue
+        val riverColor = Triple(0.15f, 0.48f, 0.66f)
         var prevX = xStart
         var prevZ = riverZAt(prevX)
-        var prevY = heightAt(prevX, prevZ) - 0.25f
+        var prevY = heightAt(prevX, prevZ) - 0.05f
         for (i in 1..steps) {
             val x = xStart + (xEnd - xStart) * i / steps
             val z = riverZAt(x)
-            val y = heightAt(x, z) - 0.25f
+            val y = heightAt(x, z) - 0.05f
             pushQuad(Vec3(prevX, prevY, prevZ - RIVER_HALF_W), Vec3(prevX, prevY, prevZ + RIVER_HALF_W), Vec3(x, y, z + RIVER_HALF_W), Vec3(x, y, z - RIVER_HALF_W), riverColor)
             prevX = x; prevZ = z; prevY = y
         }
-        pushBox(0f, bridgeZ, 8f, 11f, 0.6f, bridgeY, Triple(0.58f, 0.56f, 0.52f))
+        val bridgeStone = Triple(0.58f, 0.56f, 0.52f)
+        pushBox(0f, bridgeZ, 8f, 11f, 0.6f, bridgeY, bridgeStone)
+        pushBox(0f, bridgeZ - 5f, 8.5f, 0.6f, 0.5f, bridgeY + 0.6f, bridgeStone)
+        pushBox(0f, bridgeZ + 5f, 8.5f, 0.6f, 0.5f, bridgeY + 0.6f, bridgeStone)
     }
 
-    /** Non-null (the bridge deck height) only while standing on the bridge footprint. */
     fun bridgeHeightIfOn(x: Float, z: Float): Float? =
         if (abs(x) < BRIDGE_X_HALF && abs(z - bridgeZ) < BRIDGE_Z_HALF) bridgeY else null
 
@@ -175,7 +185,6 @@ class World {
         buildRoad()
         buildRiverAndBridge()
 
-        // the original six houses: roofed, terrain-following, brightened wood/stone variety
         val bList = listOf(
             Building(-16f, -25f, 9f, 8f, 7f), Building(16f, -45f, 11f, 6f, 10f), Building(-13f, 30f, 6f, 10f, 5f),
             Building(19f, 65f, 9f, 9f, 8f), Building(-20f, 95f, 7f, 7f, 6f), Building(15f, -95f, 8f, 5f, 9f)
@@ -189,9 +198,9 @@ class World {
             val by = heightAt(b.x, b.z)
             pushBox(b.x, b.z, b.w, b.d, b.h, by, houseColors[i])
             pushCone(b.x, b.z, by + b.h, b.h * 0.5f, sqrt(b.w * b.w + b.d * b.d) / 2f * 0.9f, Triple(0.60f, 0.22f, 0.15f), 4)
+            pushShadowBlob(b.x, b.z, sqrt(b.w * b.w + b.d * b.d) / 2f * 1.2f)
         }
 
-        // a small village of huts near the start
         val cottages = listOf(
             Triple(-14f, 8f, Triple(4f, 4f, 2.6f)), Triple(-9f, 14f, Triple(3.5f, 3.5f, 2.3f)),
             Triple(13f, 6f, Triple(4.2f, 3.8f, 2.6f)), Triple(18f, 15f, Triple(3.6f, 3.6f, 2.4f)),
@@ -203,9 +212,9 @@ class World {
             val by = heightAt(cx, cz)
             pushBox(cx, cz, w, d, h, by, Triple(0.40f, 0.24f, 0.12f))
             pushCone(cx, cz, by + h, h * 0.6f, sqrt(w * w + d * d) / 2f * 0.95f, Triple(0.60f, 0.22f, 0.15f), 4)
+            pushShadowBlob(cx, cz, sqrt(w * w + d * d) / 2f * 1.2f)
         }
 
-        // castle keep + four corner towers with turret roofs
         val castle = listOf(
             Building(0f, 140f, 14f, 14f, 10f),
             Building(-7f, 133f, 3f, 3f, 13f), Building(7f, 133f, 3f, 3f, 13f),
@@ -215,14 +224,21 @@ class World {
         val turretRoof = Triple(0.55f, 0.20f, 0.16f)
         for (b in castle) {
             buildings.add(b)
-            pushBox(b.x, b.z, b.w, b.d, b.h, heightAt(b.x, b.z), stoneCol)
+            val by = heightAt(b.x, b.z)
+            pushBox(b.x, b.z, b.w, b.d, b.h, by, stoneCol)
+            pushShadowBlob(b.x, b.z, sqrt(b.w * b.w + b.d * b.d) / 2f * 1.3f)
         }
         for (i in 1..4) {
             val b = castle[i]
             pushCone(b.x, b.z, heightAt(b.x, b.z) + b.h, 2.4f, 2.6f, turretRoof, 4)
         }
+        val curtainH = 6f
+        val curtainY = heightAt(0f, 140f)
+        buildings.add(Building(0f, 133f, 14f, 1.2f, curtainH)); pushBox(0f, 133f, 14f, 1.2f, curtainH, curtainY, stoneCol)
+        buildings.add(Building(0f, 147f, 14f, 1.2f, curtainH)); pushBox(0f, 147f, 14f, 1.2f, curtainH, curtainY, stoneCol)
+        buildings.add(Building(-7f, 140f, 1.2f, 14f, curtainH)); pushBox(-7f, 140f, 1.2f, 14f, curtainH, curtainY, stoneCol)
+        buildings.add(Building(7f, 140f, 1.2f, 14f, curtainH)); pushBox(7f, 140f, 1.2f, 14f, curtainH, curtainY, stoneCol)
 
-        // ancient ruins: an incomplete broken wall (missing one side), weathered mossy stone
         val ruinStoneCol = Triple(0.40f, 0.42f, 0.34f)
         val ruinSegs = listOf(
             Triple(-45f, 108f, 4.2f), Triple(-41f, 112f, 2.0f), Triple(-49f, 112f, 1.4f), Triple(-45f, 116f, 3.0f)
@@ -230,9 +246,9 @@ class World {
         for ((rx, rz, rh) in ruinSegs) {
             buildings.add(Building(rx, rz, 2.2f, 2.2f, rh))
             pushBox(rx, rz, 2.2f, 2.2f, rh, heightAt(rx, rz), ruinStoneCol)
+            pushShadowBlob(rx, rz, 1.8f)
         }
 
-        // scattered light forest (deterministic pseudo-random, no rng dependency needed)
         var seed = 0x9E3779B9.toInt()
         fun rnd(): Float {
             seed = seed xor (seed shl 13); seed = seed xor (seed ushr 17); seed = seed xor (seed shl 5)
@@ -242,13 +258,14 @@ class World {
             val z = rnd() * 420f - 210f
             val side = if (rnd() < 0.5f) -1f else 1f
             val x = side * (6f + rnd() * 32f)
-            trees.add(Tree(x, z, 0.55f))
+            trees.add(Tree(x, z, 0.6f))
             val by = heightAt(x, z)
-            pushBox(x, z, 0.35f, 0.35f, 1.1f, by, Triple(0.20f, 0.13f, 0.08f))
-            pushCone(x, z, by + 0.9f, 2.6f, 1.4f, Triple(0.14f, 0.42f, 0.16f), 7)
+            pushBox(x, z, 0.4f, 0.4f, 2.0f, by, Triple(0.20f, 0.13f, 0.08f))
+            pushCone(x, z, by + 1.6f, 4.0f, 1.7f, Triple(0.14f, 0.42f, 0.16f), 7)
+            pushCone(x, z, by + 4.2f, 2.0f, 1.05f, Triple(0.10f, 0.36f, 0.14f), 7)
+            pushShadowBlob(x, z, 1.9f)
         }
 
-        // a separate dense forest patch (tighter packing, darker canopy, distinct from the above)
         var seedF = 0x1234ABCD.toInt()
         fun rndF(): Float {
             seedF = seedF xor (seedF shl 13); seedF = seedF xor (seedF ushr 17); seedF = seedF xor (seedF shl 5)
@@ -260,10 +277,12 @@ class World {
             val rad = sqrt(rndF()) * denseRadius
             val x = denseCenterX + cos(ang) * rad
             val z = denseCenterZ + sin(ang) * rad
-            trees.add(Tree(x, z, 0.45f))
+            trees.add(Tree(x, z, 0.5f))
             val by = heightAt(x, z)
-            pushBox(x, z, 0.3f, 0.3f, 1.0f, by, Triple(0.18f, 0.12f, 0.07f))
-            pushCone(x, z, by + 0.8f, 2.3f, 1.15f, Triple(0.09f, 0.30f, 0.13f), 6)
+            pushBox(x, z, 0.32f, 0.32f, 1.6f, by, Triple(0.18f, 0.12f, 0.07f))
+            pushCone(x, z, by + 1.3f, 3.2f, 1.3f, Triple(0.09f, 0.30f, 0.13f), 6)
+            pushCone(x, z, by + 3.3f, 1.6f, 0.85f, Triple(0.07f, 0.26f, 0.11f), 6)
+            pushShadowBlob(x, z, 1.5f)
         }
     }
 
@@ -278,7 +297,6 @@ class World {
             val dx = x - t.x; val dz = z - t.z
             if (dx * dx + dz * dz < (t.r + playerR) * (t.r + playerR)) return true
         }
-        // river blocks wading in -- unless standing on the bridge footprint
         if (bridgeHeightIfOn(x, z) == null) {
             val rz = riverZAt(x)
             if (abs(z - rz) < RIVER_HALF_W + playerR) return true
@@ -287,7 +305,10 @@ class World {
     }
 }
 
-// STATUS: still one fixed, hand-authored layout (terrain grid + placed props), not the
-// chunk-based/streamed/seed-driven infinite open world the full brief calls for. That's
-// still a separate, larger follow-up -- what changed here is real geometry (mountains,
-// ruins, a second forest, river collision), not a re-skin of the old flat layout.
+// STATUS: still one fixed, hand-authored layout, not the chunk-based/streamed/seed-driven
+// infinite open world the full brief calls for. Shadows here are cheap ground-contact
+// blobs, not true sun-cast shadow mapping -- that needs a second depth-only render pass,
+// a light-space projection matrix, and bias tuning that is notoriously hard to get right
+// without ever seeing the actual rendered frame, so a guaranteed-to-look-reasonable
+// technique was the safer choice this round. Real shadow mapping is a good next step if
+// wanted, ideally with a screenshot in the loop to tune it against.
