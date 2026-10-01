@@ -82,6 +82,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         'X', 'Y', 'U', 'J', 'C', 'L', 'Q', '0', 'O', 'Z', 'm', 'w', 'q', 'p', 'd', 'b', 'k', 'h', 'a', 'o',
         '*', '#', 'M', 'W', '&', '8', '%', 'B', '@', '$',
         '\u25E6', '\u25CB', '\u25AA', '\u25CF', '\u2596', '\u2597', '\u2598', '\u259D',
+        '\u2801', '\u2803', '\u2807', '\u280F', '\u281F', '\u283F', '\u287F', '\u28FF',
         '\u2591', '\u2592', '\u2593', '\u2588'
     )
     private val structureGlyphs = listOf('\u2580', '\u2584', '\u258C', '\u2590', '\u259A', '\u259E')
@@ -414,34 +415,41 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 float dDiff = diagA - diagB;
                 float ah = abs(hDiff), av = abs(vDiff), ad = abs(dDiff);
 
-                float glyphIdx;
-                float structureThreshold = 0.16;
-                if (variance < structureThreshold) {
-                    glyphIdx = floor(clamp(lC, 0.0, 0.999) * uToneCount);
-                } else if (ah >= av && ah >= ad) {
-                    glyphIdx = uToneCount + (hDiff > 0.0 ? 0.0 : 1.0);
-                } else if (av >= ah && av >= ad) {
-                    glyphIdx = uToneCount + (vDiff > 0.0 ? 2.0 : 3.0);
-                } else {
-                    glyphIdx = uToneCount + (dDiff > 0.0 ? 4.0 : 5.0);
-                }
-
-                // Background/gap pixels are tinted from the scene's OWN average color
-                // (already correctly fog-blended by distance in the 3D pass), not a flat
-                // neutral fog tone -- otherwise anything dimmer than sunlit grass (which
-                // always picks a dense, high-ink glyph) mostly shows as gray/blank instead
-                // of its real hue.
-                vec3 bg = avgColor * 0.55;
-                vec3 ink = avgColor * 1.6;
-
                 vec2 local = fract(frag / uCellPx);
                 float gap = uGapFrac;
+                vec3 bg = avgColor * 0.55;
+                vec3 ink = avgColor * 1.6;
                 vec3 col;
+
                 if (local.x < gap || local.x > 1.0-gap || local.y < gap || local.y > 1.0-gap) {
                     col = bg;
                 } else {
                     vec2 inner = (local - gap) / (1.0 - 2.0*gap);
-                    float mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
+                    float mask;
+                    float structureThreshold = 0.16;
+                    if (variance < structureThreshold) {
+                        // cross-fade between the two nearest tone-ramp glyphs by fractional
+                        // brightness, instead of a hard step -- this is what actually removes
+                        // visible banding in smooth gradients (sky, fields), independent of
+                        // how many glyphs exist in the ramp.
+                        float toneT = clamp(lC, 0.0, 0.999) * uToneCount;
+                        float idxLow = floor(toneT);
+                        float idxHigh = min(idxLow + 1.0, uToneCount - 1.0);
+                        float toneFrac = fract(toneT);
+                        float maskA = texture(uAtlas, vec2((idxLow+inner.x)/uAtlasCount, inner.y)).r;
+                        float maskB = texture(uAtlas, vec2((idxHigh+inner.x)/uAtlasCount, inner.y)).r;
+                        mask = mix(maskA, maskB, toneFrac);
+                    } else {
+                        float glyphIdx;
+                        if (ah >= av && ah >= ad) {
+                            glyphIdx = uToneCount + (hDiff > 0.0 ? 0.0 : 1.0);
+                        } else if (av >= ah && av >= ad) {
+                            glyphIdx = uToneCount + (vDiff > 0.0 ? 2.0 : 3.0);
+                        } else {
+                            glyphIdx = uToneCount + (dDiff > 0.0 ? 4.0 : 5.0);
+                        }
+                        mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
+                    }
                     col = mix(bg, ink, mask);
                 }
                 col *= 0.94 + 0.06*sin(frag.y*3.14159265);

@@ -4,6 +4,7 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -65,6 +66,25 @@ class World {
     ) {
         pushTriVC(a, ca, b, cb, c, cc); pushTriVC(a, ca, c, cc, d, cd)
     }
+    // explicit-per-vertex-normal versions -- used only for terrain, so its shading comes
+    // from the smooth ANALYTIC surface normal of the height field (see terrainNormalAt)
+    // instead of one flat normal per triangle, which is what was making the ground look
+    // like faceted low-poly glass instead of a continuous landscape.
+    private fun pushVertexRaw(p: Vec3, n: Vec3, col: Triple<Float, Float, Float>) {
+        vertices.add(p.x); vertices.add(p.y); vertices.add(p.z)
+        vertices.add(n.x); vertices.add(n.y); vertices.add(n.z)
+        vertices.add(col.first); vertices.add(col.second); vertices.add(col.third)
+    }
+    private fun pushTriVCN(a: Vec3, na: Vec3, ca: Triple<Float, Float, Float>, b: Vec3, nb: Vec3, cb: Triple<Float, Float, Float>, c: Vec3, nc: Vec3, cc: Triple<Float, Float, Float>) {
+        pushVertexRaw(a, na, ca); pushVertexRaw(b, nb, cb); pushVertexRaw(c, nc, cc)
+    }
+    private fun pushQuadVCN(
+        a: Vec3, na: Vec3, ca: Triple<Float, Float, Float>, b: Vec3, nb: Vec3, cb: Triple<Float, Float, Float>,
+        c: Vec3, nc: Vec3, cc: Triple<Float, Float, Float>, d: Vec3, nd: Vec3, cd: Triple<Float, Float, Float>
+    ) {
+        pushTriVCN(a, na, ca, b, nb, cb, c, nc, cc); pushTriVCN(a, na, ca, c, nc, cc, d, nd, cd)
+    }
+
     private fun pushBox(cx: Float, cz: Float, w: Float, d: Float, h: Float, baseY: Float, col: Triple<Float, Float, Float>) {
         val x0 = cx - w / 2; val x1 = cx + w / 2; val z0 = cz - d / 2; val z1 = cz + d / 2
         val y0 = baseY; val y1 = baseY + h
@@ -138,14 +158,55 @@ class World {
         Mountain(160f, 175f, 60f, 28f),
         Mountain(90f, 195f, 50f, 16f)
     )
+    // coherent value noise (hash + smoothstep interpolation), no external library needed.
+    // This replaces a pure sine-wave height field, which -- however many octaves you
+    // stack -- always looks visibly periodic/regular. Noise does not repeat, which is
+    // most of what separates "natural-looking terrain" from "obviously procedural ripple".
+    private fun hash2(xi: Int, zi: Int): Float {
+        var h = xi * 374761393 + zi * 668265263
+        h = (h xor (h shr 13)) * 1274126177
+        h = h xor (h shr 16)
+        return (h and 0x7fffffff).toFloat() / 0x7fffffff.toFloat()
+    }
+    private fun valueNoise(x: Float, z: Float): Float {
+        val xi = floor(x).toInt(); val zi = floor(z).toInt()
+        val xf = x - xi; val zf = z - zi
+        val v00 = hash2(xi, zi); val v10 = hash2(xi + 1, zi)
+        val v01 = hash2(xi, zi + 1); val v11 = hash2(xi + 1, zi + 1)
+        val sx = xf * xf * (3f - 2f * xf); val sz = zf * zf * (3f - 2f * zf)
+        val a = v00 + (v10 - v00) * sx
+        val b = v01 + (v11 - v01) * sx
+        return a + (b - a) * sz
+    }
+    private fun fbm(x: Float, z: Float, octaves: Int): Float {
+        var total = 0f; var amp = 1f; var freq = 1f; var maxAmp = 0f
+        for (i in 0 until octaves) {
+            total += valueNoise(x * freq, z * freq) * amp
+            maxAmp += amp
+            amp *= 0.5f; freq *= 2f
+        }
+        return total / maxAmp
+    }
     private fun baseHeightAt(x: Float, z: Float): Float {
-        var h = 0.9f * sin(x * 0.035f) * cos(z * 0.045f) + 0.4f * sin(x * 0.09f + 1.3f) * cos(z * 0.07f + 0.6f)
+        var h = (fbm(x * 0.045f, z * 0.045f, 5) - 0.5f) * 5.0f
+        h += (fbm(x * 0.25f, z * 0.25f, 3) - 0.5f) * 0.6f // small-scale roughness
         for (m in MOUNTAINS) {
             val dx = x - m.x; val dz = z - m.z
             val d2 = dx * dx + dz * dz
             h += m.peak * exp(-d2 / (2f * m.radius * m.radius))
         }
         return h
+    }
+    /** Analytic surface normal of the (full, river-dip-included) height field via central
+     *  differences -- smooth per-vertex shading without needing to average an explicit
+     *  mesh's face normals. */
+    private fun terrainNormalAt(x: Float, z: Float): Vec3 {
+        val eps = 0.4f
+        val hL = heightAt(x - eps, z); val hR = heightAt(x + eps, z)
+        val hD = heightAt(x, z - eps); val hU = heightAt(x, z + eps)
+        val dX = Vec3(2f * eps, hR - hL, 0f)
+        val dZ = Vec3(0f, hU - hD, 2f * eps)
+        return norm(cross(dZ, dX))
     }
 
     private val RIVER_BASE_Z = 45f
@@ -167,11 +228,13 @@ class World {
         var r = 0.16f + 0.22f * (1f - green)
         var g = 0.34f + 0.28f * green
         var b = 0.10f + 0.09f * green
+        val fine = (fbm(x * 0.3f, z * 0.3f, 2) - 0.5f) * 0.10f // subtle mottling, breaks up flat color patches
+        r += fine; g += fine * 0.8f; b += fine * 0.6f
         val rockT = ((h - 6f) / 10f).coerceIn(0f, 1f)
         r += (0.42f - r) * rockT; g += (0.40f - g) * rockT; b += (0.40f - b) * rockT
         val snowT = ((h - 16f) / 8f).coerceIn(0f, 1f)
         r += (0.88f - r) * snowT; g += (0.90f - g) * snowT; b += (0.92f - b) * snowT
-        return Triple(r, g, b)
+        return Triple(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
     }
 
     // finer grid so the (fairly narrow) river valley is actually resolved by the mesh
@@ -184,15 +247,46 @@ class World {
             while (z < half) {
                 val x0 = x; val x1 = x + step; val z0 = z; val z1 = z + step
                 val hA = heightAt(x0, z0); val hB = heightAt(x0, z1); val hC = heightAt(x1, z1); val hD = heightAt(x1, z0)
-                pushQuadVC(
-                    Vec3(x0, hA, z0), terrainColor(x0, z0, hA),
-                    Vec3(x0, hB, z1), terrainColor(x0, z1, hB),
-                    Vec3(x1, hC, z1), terrainColor(x1, z1, hC),
-                    Vec3(x1, hD, z0), terrainColor(x1, z0, hD)
+                pushQuadVCN(
+                    Vec3(x0, hA, z0), terrainNormalAt(x0, z0), terrainColor(x0, z0, hA),
+                    Vec3(x0, hB, z1), terrainNormalAt(x0, z1), terrainColor(x0, z1, hB),
+                    Vec3(x1, hC, z1), terrainNormalAt(x1, z1), terrainColor(x1, z1, hC),
+                    Vec3(x1, hD, z0), terrainNormalAt(x1, z0), terrainColor(x1, z0, hD)
                 )
                 z += step
             }
             x += step
+        }
+    }
+    /** Small scattered rock clusters across open terrain, so flat ground isn't a bare
+     *  color void -- skipped near the road and river so nothing spawns on top of them. */
+    private fun buildRocks() {
+        var seedR = 0x5EED5EED.toInt()
+        fun rndR(): Float {
+            seedR = seedR xor (seedR shl 13); seedR = seedR xor (seedR ushr 17); seedR = seedR xor (seedR shl 5)
+            return (seedR.toLong() and 0xFFFFFFFFL).toFloat() / 4294967295f
+        }
+        var placed = 0
+        var tries = 0
+        while (placed < 40 && tries < 400) {
+            tries++
+            val z = rndR() * 380f - 190f
+            val side = if (rndR() < 0.5f) -1f else 1f
+            val x = side * (8f + rndR() * 170f)
+            if (abs(x) < 6f) continue
+            if (abs(z - riverZAt(x)) < RIVER_HALF_W + 2f) continue
+            val by = heightAt(x, z)
+            val baseShade = 0.34f + rndR() * 0.10f
+            val col = Triple(baseShade, baseShade * 0.97f, baseShade * 0.90f)
+            val clump = 2 + (rndR() * 2f).toInt()
+            for (k in 0 until clump) {
+                val ox = x + (rndR() - 0.5f) * 0.9f
+                val oz = z + (rndR() - 0.5f) * 0.9f
+                val rs = 0.25f + rndR() * 0.35f
+                pushBox(ox, oz, rs, rs * (0.8f + rndR() * 0.4f), rs * (0.7f + rndR() * 0.5f), heightAt(ox, oz), col)
+            }
+            pushShadowBlob(x, z, 0.9f)
+            placed++
         }
     }
 
@@ -333,6 +427,7 @@ class World {
         buildTerrain()
         buildRoad()
         buildRiverAndBridge()
+        buildRocks()
 
         val bList = listOf(
             Triple(-16f, -25f, Triple(9f, 8f, 7f)), Triple(16f, -45f, Triple(11f, 6f, 10f)), Triple(-13f, 30f, Triple(6f, 10f, 5f)),
