@@ -258,7 +258,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlasTex)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(glyphProgram, "uAtlas"), 1)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(glyphProgram, "uRes"), screenW.toFloat(), screenH.toFloat())
-        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 140).coerceIn(2, 5).toFloat()
+        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 170).coerceIn(2, 4).toFloat()
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), cellPx)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uToneCount"), toneGlyphs.size.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uAtlasCount"), allGlyphs.size.toFloat())
@@ -415,41 +415,34 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 float dDiff = diagA - diagB;
                 float ah = abs(hDiff), av = abs(vDiff), ad = abs(dDiff);
 
+                // NOTE: this used to cross-fade between the two nearest tone-ramp glyphs'
+                // ink masks by fractional brightness, intended to remove banding. In practice
+                // blending two DIFFERENT glyph SHAPES' alpha masks doesn't read as a clean
+                // in-between character -- their ink doesn't spatially overlap, so it shows up
+                // as a faint doubled/ghosted smear instead, which likely made things look
+                // worse rather than smoother. Reverted to a single, crisp glyph per cell.
+                float glyphIdx;
+                float structureThreshold = 0.16;
+                if (variance < structureThreshold) {
+                    glyphIdx = floor(clamp(lC, 0.0, 0.999) * uToneCount);
+                } else if (ah >= av && ah >= ad) {
+                    glyphIdx = uToneCount + (hDiff > 0.0 ? 0.0 : 1.0);
+                } else if (av >= ah && av >= ad) {
+                    glyphIdx = uToneCount + (vDiff > 0.0 ? 2.0 : 3.0);
+                } else {
+                    glyphIdx = uToneCount + (dDiff > 0.0 ? 4.0 : 5.0);
+                }
+
                 vec2 local = fract(frag / uCellPx);
                 float gap = uGapFrac;
                 vec3 bg = avgColor * 0.55;
                 vec3 ink = avgColor * 1.6;
                 vec3 col;
-
                 if (local.x < gap || local.x > 1.0-gap || local.y < gap || local.y > 1.0-gap) {
                     col = bg;
                 } else {
                     vec2 inner = (local - gap) / (1.0 - 2.0*gap);
-                    float mask;
-                    float structureThreshold = 0.16;
-                    if (variance < structureThreshold) {
-                        // cross-fade between the two nearest tone-ramp glyphs by fractional
-                        // brightness, instead of a hard step -- this is what actually removes
-                        // visible banding in smooth gradients (sky, fields), independent of
-                        // how many glyphs exist in the ramp.
-                        float toneT = clamp(lC, 0.0, 0.999) * uToneCount;
-                        float idxLow = floor(toneT);
-                        float idxHigh = min(idxLow + 1.0, uToneCount - 1.0);
-                        float toneFrac = fract(toneT);
-                        float maskA = texture(uAtlas, vec2((idxLow+inner.x)/uAtlasCount, inner.y)).r;
-                        float maskB = texture(uAtlas, vec2((idxHigh+inner.x)/uAtlasCount, inner.y)).r;
-                        mask = mix(maskA, maskB, toneFrac);
-                    } else {
-                        float glyphIdx;
-                        if (ah >= av && ah >= ad) {
-                            glyphIdx = uToneCount + (hDiff > 0.0 ? 0.0 : 1.0);
-                        } else if (av >= ah && av >= ad) {
-                            glyphIdx = uToneCount + (vDiff > 0.0 ? 2.0 : 3.0);
-                        } else {
-                            glyphIdx = uToneCount + (dDiff > 0.0 ? 4.0 : 5.0);
-                        }
-                        mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
-                    }
+                    float mask = texture(uAtlas, vec2((glyphIdx+inner.x)/uAtlasCount, inner.y)).r;
                     col = mix(bg, ink, mask);
                 }
                 col *= 0.94 + 0.06*sin(frag.y*3.14159265);

@@ -188,8 +188,12 @@ class World {
         return total / maxAmp
     }
     private fun baseHeightAt(x: Float, z: Float): Float {
+        // NOTE: a second, higher-frequency noise octave (wavelength ~4 units) used to be
+        // added here for "small-scale roughness". The terrain grid step is 5 units, which
+        // is COARSER than that wavelength, so adjacent grid vertices sampled essentially
+        // uncorrelated noise -- i.e. visible per-vertex jitter/spikes, not roughness. This
+        // was very likely the main cause of the terrain looking worse. Removed.
         var h = (fbm(x * 0.045f, z * 0.045f, 5) - 0.5f) * 5.0f
-        h += (fbm(x * 0.25f, z * 0.25f, 3) - 0.5f) * 0.6f // small-scale roughness
         for (m in MOUNTAINS) {
             val dx = x - m.x; val dz = z - m.z
             val d2 = dx * dx + dz * dz
@@ -237,10 +241,43 @@ class World {
         return Triple(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
     }
 
+    // Mountain data, flattened for passing to native code (see NativeTerrain.kt). Native
+    // terrain generation hardcodes this same data internally (see terrain.cpp) rather than
+    // taking it as a parameter, to keep the JNI surface smaller; this array exists only in
+    // case other native calls need it later.
+    private val mountainsFlat: FloatArray by lazy {
+        val arr = FloatArray(MOUNTAINS.size * 4)
+        for ((i, m) in MOUNTAINS.withIndex()) {
+            arr[i * 4] = m.x; arr[i * 4 + 1] = m.z; arr[i * 4 + 2] = m.radius; arr[i * 4 + 3] = m.peak
+        }
+        arr
+    }
+
     // finer grid so the (fairly narrow) river valley is actually resolved by the mesh
-    // instead of being smoothed away between coarse grid vertices
+    // instead of being smoothed away between coarse grid vertices.
+    //
+    // Generation is attempted in native C++ first (see terrain.cpp) for real performance --
+    // this loop runs 6,400+ times, each doing 4 heightAt + 4 normalAt (each of which itself
+    // calls heightAt 4 more times) + 4 terrainColor calls, i.e. tens of thousands of noise
+    // evaluations, which is exactly the kind of hot numeric loop native code is for. If the
+    // native library isn't available, or throws for ANY reason, this falls back to the
+    // (identical-formula) Kotlin path below -- a native-code failure should disable this one
+    // optimization, never crash the app or block it from starting.
     private fun buildTerrain() {
         val half = 200f; val step = 5f
+        if (NativeTerrain.available) {
+            try {
+                val data = NativeTerrain.nativeBuildTerrain(half, step)
+                for (v in data) vertices.add(v)
+                return
+            } catch (e: Throwable) {
+                android.util.Log.w("World", "native terrain build failed at runtime, falling back to Kotlin", e)
+            }
+        }
+        buildTerrainKotlin(half, step)
+    }
+
+    private fun buildTerrainKotlin(half: Float, step: Float) {
         var x = -half
         while (x < half) {
             var z = -half
