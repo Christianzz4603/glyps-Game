@@ -71,8 +71,8 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var atlasTex = 0
     private var fsQuadVbo = 0
 
-    private val lw = 280
-    private val lh = 158
+    private val lw = 480
+    private val lh = 270
 
     // A much larger, finer sparse->dense density ramp (70 characters) for smoother
     // gradation, plus the 4 shade blocks, before the 6 structural glyphs below.

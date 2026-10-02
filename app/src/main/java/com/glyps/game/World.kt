@@ -213,17 +213,67 @@ class World {
         return norm(cross(dZ, dX))
     }
 
-    private val RIVER_BASE_Z = 45f
-    private val RIVER_HALF_W = 3.5f
-    private val BRIDGE_X_HALF = 4.5f
-    private val BRIDGE_Z_HALF = 6.0f
-    private fun riverZAt(x: Float): Float = RIVER_BASE_Z + sin(x * 0.02f) * 15f
+    // --- rivers via flow accumulation instead of a scripted path ---
+    // Every grid cell starts with uniform "rainfall"; processed highest-elevation-first,
+    // each cell hands its accumulated flow to whichever of its 8 neighbors is lowest.
+    // Cells with enough accumulated flow become stream/river, with depth growing with
+    // flow -- so rivers emerge from wherever the terrain (mountains included) actually
+    // drains, and get wider downstream, instead of being drawn along a fixed path.
+    private val GRID_HALF = 200f
+    private val GRID_STEP = 5f
+    private val GRID_N = (2 * GRID_HALF / GRID_STEP).toInt() + 1 // 81
+
+    private fun gridX(i: Int) = -GRID_HALF + i * GRID_STEP
+    private fun gridZ(j: Int) = -GRID_HALF + j * GRID_STEP
+
+    private val flowDepth: Array<FloatArray> by lazy {
+        val n = GRID_N
+        val height = Array(n) { i -> FloatArray(n) { j -> baseHeightAt(gridX(i), gridZ(j)) } }
+        val flow = Array(n) { FloatArray(n) { 1f } }
+
+        val order = ArrayList<Int>(n * n)
+        for (idx in 0 until n * n) order.add(idx)
+        order.sortByDescending { idx -> height[idx / n][idx % n] }
+
+        for (idx in order) {
+            val i = idx / n; val j = idx % n
+            var bestI = -1; var bestJ = -1; var bestH = height[i][j]
+            for (di in -1..1) for (dj in -1..1) {
+                if (di == 0 && dj == 0) continue
+                val ni = i + di; val nj = j + dj
+                if (ni < 0 || ni >= n || nj < 0 || nj >= n) continue
+                if (height[ni][nj] < bestH) { bestH = height[ni][nj]; bestI = ni; bestJ = nj }
+            }
+            if (bestI >= 0) flow[bestI][bestJ] += flow[i][j]
+        }
+
+        Array(n) { i -> FloatArray(n) { j ->
+            val f = flow[i][j]
+            if (f > 35f) ((f - 35f) / 40f).coerceIn(0f, 1f) * 1.6f else 0f
+        } }
+    }
+
+    /** Bilinear lookup (not nearest-cell) so heightAt stays continuous -- a hard per-cell
+     *  step would make the central-difference normals in terrainNormalAt noisy at grid
+     *  boundaries, the same class of bug as the earlier undersampled-noise jitter. */
+    private fun riverDepthAt(x: Float, z: Float): Float {
+        val fx = (x + GRID_HALF) / GRID_STEP
+        val fz = (z + GRID_HALF) / GRID_STEP
+        val i0 = floor(fx).toInt().coerceIn(0, GRID_N - 1)
+        val j0 = floor(fz).toInt().coerceIn(0, GRID_N - 1)
+        val i1 = (i0 + 1).coerceIn(0, GRID_N - 1)
+        val j1 = (j0 + 1).coerceIn(0, GRID_N - 1)
+        val tx = (fx - i0).coerceIn(0f, 1f)
+        val tz = (fz - j0).coerceIn(0f, 1f)
+        val d00 = flowDepth[i0][j0]; val d10 = flowDepth[i1][j0]
+        val d01 = flowDepth[i0][j1]; val d11 = flowDepth[i1][j1]
+        val a = d00 + (d10 - d00) * tx
+        val b = d01 + (d11 - d01) * tx
+        return a + (b - a) * tz
+    }
 
     fun heightAt(x: Float, z: Float): Float {
-        val h = baseHeightAt(x, z)
-        val distToRiver = abs(z - riverZAt(x))
-        val dipT = (1f - (distToRiver / 7f).coerceIn(0f, 1f))
-        return h - dipT * dipT * 1.3f
+        return baseHeightAt(x, z) - riverDepthAt(x, z)
     }
 
     private fun terrainColor(x: Float, z: Float, h: Float): Triple<Float, Float, Float> {
@@ -238,6 +288,11 @@ class World {
         r += (0.42f - r) * rockT; g += (0.40f - g) * rockT; b += (0.40f - b) * rockT
         val snowT = ((h - 16f) / 8f).coerceIn(0f, 1f)
         r += (0.88f - r) * snowT; g += (0.90f - g) * snowT; b += (0.92f - b) * snowT
+        val river = riverDepthAt(x, z)
+        if (river > 0f) {
+            val t = (river / 1.6f).coerceIn(0f, 1f)
+            r += (0.15f - r) * t; g += (0.48f - g) * t; b += (0.66f - b) * t
+        }
         return Triple(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
     }
 
@@ -253,27 +308,15 @@ class World {
         arr
     }
 
-    // finer grid so the (fairly narrow) river valley is actually resolved by the mesh
-    // instead of being smoothed away between coarse grid vertices.
-    //
-    // Generation is attempted in native C++ first (see terrain.cpp) for real performance --
-    // this loop runs 6,400+ times, each doing 4 heightAt + 4 normalAt (each of which itself
-    // calls heightAt 4 more times) + 4 terrainColor calls, i.e. tens of thousands of noise
-    // evaluations, which is exactly the kind of hot numeric loop native code is for. If the
-    // native library isn't available, or throws for ANY reason, this falls back to the
-    // (identical-formula) Kotlin path below -- a native-code failure should disable this one
-    // optimization, never crash the app or block it from starting.
+    // NOTE: temporarily NOT using the native path here. The flow-accumulation river system
+    // above is new and still settling, and terrain.cpp's native implementation does not yet
+    // know about it (it still has the old scripted-path river baked in) -- running native
+    // right now would silently show the OLD river instead of this one. Keeping both in sync
+    // blind is exactly the kind of mismatch that caused problems before, so this stays
+    // Kotlin-only until the new system is confirmed good; porting it to native afterward is
+    // straightforward (same approach as before, plus passing the flowDepth grid across).
     private fun buildTerrain() {
         val half = 200f; val step = 5f
-        if (NativeTerrain.available) {
-            try {
-                val data = NativeTerrain.nativeBuildTerrain(half, step)
-                for (v in data) vertices.add(v)
-                return
-            } catch (e: Throwable) {
-                android.util.Log.w("World", "native terrain build failed at runtime, falling back to Kotlin", e)
-            }
-        }
         buildTerrainKotlin(half, step)
     }
 
@@ -311,7 +354,7 @@ class World {
             val side = if (rndR() < 0.5f) -1f else 1f
             val x = side * (8f + rndR() * 170f)
             if (abs(x) < 6f) continue
-            if (abs(z - riverZAt(x)) < RIVER_HALF_W + 2f) continue
+            if (riverDepthAt(x, z) > 0.05f) continue
             val by = heightAt(x, z)
             val baseShade = 0.34f + rndR() * 0.10f
             val col = Triple(baseShade, baseShade * 0.97f, baseShade * 0.90f)
@@ -340,23 +383,26 @@ class World {
         }
     }
 
-    private val bridgeZ = riverZAt(0f)
-    private val bridgeY = baseHeightAt(0f, bridgeZ) + 0.35f
+    private val BRIDGE_X_HALF = 4.5f
+    private val BRIDGE_Z_HALF = 6.0f
 
-    private fun buildRiverAndBridge() {
-        val steps = 80
-        val xStart = -200f; val xEnd = 200f
-        val riverColor = Triple(0.15f, 0.48f, 0.66f)
-        var prevX = xStart
-        var prevZ = riverZAt(prevX)
-        var prevY = heightAt(prevX, prevZ) - 0.4f // generous clearance below the (now finer) carved valley floor
-        for (i in 1..steps) {
-            val x = xStart + (xEnd - xStart) * i / steps
-            val z = riverZAt(x)
-            val y = heightAt(x, z) - 0.4f
-            pushQuad(Vec3(prevX, prevY, prevZ - RIVER_HALF_W), Vec3(prevX, prevY, prevZ + RIVER_HALF_W), Vec3(x, y, z + RIVER_HALF_W), Vec3(x, y, z - RIVER_HALF_W), riverColor)
-            prevX = x; prevZ = z; prevY = y
+    // Where the road (fixed at x=0) crosses the biggest actual simulated river, instead of
+    // a hand-picked z coordinate -- found by scanning the flow grid along that column.
+    private val bridgeZ: Float by lazy {
+        val i0 = ((0f + GRID_HALF) / GRID_STEP).toInt().coerceIn(0, GRID_N - 1)
+        var bestJ = GRID_N / 2; var bestDepth = -1f
+        for (j in 0 until GRID_N) {
+            if (flowDepth[i0][j] > bestDepth) { bestDepth = flowDepth[i0][j]; bestJ = j }
         }
+        gridZ(bestJ)
+    }
+    private val bridgeY: Float by lazy { baseHeightAt(0f, bridgeZ) + 0.35f }
+
+    /** Only the physical bridge deck + rails + end piers -- the river itself is now part
+     *  of the terrain's own coloring/height (see terrainColor/heightAt above), not a
+     *  separate mesh, which also removes the entire class of z-fighting/occlusion bug the
+     *  old separate river mesh had against the ground. */
+    private fun buildBridge() {
         val bridgeStone = Triple(0.58f, 0.56f, 0.52f)
         pushBox(0f, bridgeZ, 8f, 11f, 0.6f, bridgeY, bridgeStone)
         pushBox(0f, bridgeZ - 5f, 8.5f, 0.6f, 0.5f, bridgeY + 0.6f, bridgeStone)
@@ -367,6 +413,7 @@ class World {
 
     fun bridgeHeightIfOn(x: Float, z: Float): Float? =
         if (abs(x) < BRIDGE_X_HALF && abs(z - bridgeZ) < BRIDGE_Z_HALF) bridgeY else null
+
 
     /** A real house: split walls with a walkable door gap, two glowing windows, an
      *  interior floor, a properly-aligned gable roof (not a rotated pyramid), and a
@@ -463,7 +510,7 @@ class World {
     init {
         buildTerrain()
         buildRoad()
-        buildRiverAndBridge()
+        buildBridge()
         buildRocks()
 
         val bList = listOf(
@@ -617,8 +664,7 @@ class World {
             if (dx * dx + dz * dz < (t.r + playerR) * (t.r + playerR)) return true
         }
         if (bridgeHeightIfOn(x, z) == null) {
-            val rz = riverZAt(x)
-            if (abs(z - rz) < RIVER_HALF_W + playerR) return true
+            if (riverDepthAt(x, z) > 0.12f) return true
         }
         return false
     }
