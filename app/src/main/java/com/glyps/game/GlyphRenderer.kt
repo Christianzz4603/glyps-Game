@@ -19,19 +19,28 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Two-pass glyph-grid renderer. Architecture unchanged:
- *  Pass 1 (SCENE_*):  real 3D geometry -> offscreen low-res color+depth texture.
- *  Pass 2 (GLYPH_*):  fullscreen shader samples that texture per glyph cell and picks a
- *                      glyph from the atlas. This pass's output IS the final image shown
- *                      on screen.
+ * Three-pass glyph-grid renderer:
+ *  Pass 1 (SHADOW_*): scene geometry (position only) -> a depth-only texture, rendered
+ *                      from the sun's direction (orthographic). Real shadow mapping.
+ *  Pass 2 (SCENE_*):   real 3D geometry -> offscreen color+depth texture, sampling the
+ *                      shadow texture to attenuate the sun's contribution where occluded.
+ *  Pass 3 (GLYPH_*):   fullscreen shader samples the scene texture per glyph cell and
+ *                      picks a glyph from the atlas. This pass's output IS the final
+ *                      image shown on screen.
  *
- * This revision specifically fixes a "looks pure black" report:
- *  - night previously crushed ambient/fog toward (0.03-0.05, 0.15) -- dark fantasy, but
- *    unreadable on a phone screen. Raised the night floor so shapes stay visible.
- *  - the glyph-cell gap and vignette darkening multipliers were tuned for a horror scene
- *    and were too aggressive for a colorful fantasy one; loosened both.
- *  - camera eye height now follows World.heightAt(x,z) so the new hilly terrain doesn't
- *    make the player appear to float or clip into the ground.
+ * This revision fixes "looks like a modeled game with a grid added, not real ASCII art":
+ * glyph cell size had been pushed down (across several rounds chasing "smoother") to
+ * where it approached the resolution of the 3D render feeding it. Past that point there
+ * is no information compression happening -- adjacent cells sample nearly the same
+ * source pixel and pick nearly the same glyph, so the result reads as a blurry photo with
+ * faint character-shaped texture, not bold ASCII art. Real ASCII art works BECAUSE many
+ * source pixels collapse into one clear, high-contrast character -- that compression is
+ * the whole effect. Cell size and the gap are both reset to bold, clearly legible values,
+ * on purpose reversing several of the "smoother/denser" changes from earlier rounds.
+ *
+ * Also replaces the previous ground-contact shadow blobs with real directional shadow
+ * mapping (an orthographic light-space depth pass + sampled comparison), since a flat
+ * dark disc under every object was never a real shadow.
  */
 class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
@@ -46,7 +55,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     var glyphCellPx: Float = -1f
-    var gapFraction: Float = 0f
+    var gapFraction: Float = 0.14f // bold, clearly visible glyph cells -- see class doc
 
     private val world = World()
     private var camX = 0f
@@ -63,16 +72,24 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private var sceneProgram = 0
     private var glyphProgram = 0
+    private var shadowProgram = 0
     private var sceneVbo = 0
     private var sceneVertCount = 0
     private var sceneFbo = 0
     private var sceneColorTex = 0
     private var sceneDepthRb = 0
+    private var shadowFbo = 0
+    private var shadowTex = 0
     private var atlasTex = 0
     private var fsQuadVbo = 0
 
     private val lw = 480
     private val lh = 270
+    private val SHADOW_SIZE = 1024
+
+    private val lightView = FloatArray(16)
+    private val lightProj = FloatArray(16)
+    private val lightVP = FloatArray(16)
 
     // A much larger, finer sparse->dense density ramp (70 characters) for smoother
     // gradation, plus the 4 shade blocks, before the 6 structural glyphs below.
@@ -97,6 +114,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         sceneProgram = buildProgram(SCENE_VS, SCENE_FS)
         glyphProgram = buildProgram(GLYPH_VS, GLYPH_FS)
+        shadowProgram = buildProgram(SHADOW_VS, SHADOW_FS)
 
         val verts = world.vertices.toFloatArray()
         sceneVertCount = verts.size / 9
@@ -125,6 +143,29 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
         if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
             android.util.Log.e("GlyphRenderer", "scene FBO incomplete: $status")
+        }
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+
+        // shadow map: depth-only texture + FBO, no color attachment (glDrawBuffers/
+        // glReadBuffer set to NONE). DEPTH_COMPONENT24 texture sampling is core GLES 3.0
+        // functionality (not an optional extension), and this app already requires
+        // GLES 3.0 in the manifest, so this is supported wherever the app runs at all.
+        val shadowTexArr = IntArray(1); GLES30.glGenTextures(1, shadowTexArr, 0); shadowTex = shadowTexArr[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, shadowTex)
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE, 0, GLES30.GL_DEPTH_COMPONENT, GLES30.GL_UNSIGNED_INT, null)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        val shadowFboArr = IntArray(1); GLES30.glGenFramebuffers(1, shadowFboArr, 0); shadowFbo = shadowFboArr[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, shadowFbo)
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_DEPTH_ATTACHMENT, GLES30.GL_TEXTURE_2D, shadowTex, 0)
+        GLES30.glDrawBuffers(1, intArrayOf(GLES30.GL_NONE), 0)
+        GLES30.glReadBuffer(GLES30.GL_NONE)
+        val shadowStatus = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (shadowStatus != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            android.util.Log.e("GlyphRenderer", "shadow FBO incomplete: $shadowStatus")
         }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
 
@@ -215,6 +256,33 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val fx = sin(yaw) * cos(pitch); val fy = sin(pitch); val fz = -cos(yaw) * cos(pitch)
         Matrix.setLookAtM(view, 0, camX, camY, camZ, camX + fx, camY + fy, camZ + fz, 0f, 1f, 0f)
 
+        // directional (sun) shadow: orthographic light view-projection centered on the
+        // player, looking back along the same direction as uSunDir below
+        val sunLen = sqrt(0.4f * 0.4f + 0.9f * 0.9f + 0.3f * 0.3f)
+        val sdx = 0.4f / sunLen; val sdy = 0.9f / sunLen; val sdz = 0.3f / sunLen
+        val shadowRange = 70f
+        val eyeDist = 120f
+        Matrix.setLookAtM(
+            lightView, 0,
+            camX + sdx * eyeDist, sdy * eyeDist, camZ + sdz * eyeDist,
+            camX, 0f, camZ,
+            0f, 1f, 0f
+        )
+        Matrix.orthoM(lightProj, 0, -shadowRange, shadowRange, -shadowRange, shadowRange, 1f, 260f)
+        Matrix.multiplyMM(lightVP, 0, lightProj, 0, lightView, 0)
+
+        // pass 1: depth-only render from the sun's point of view
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, shadowFbo)
+        GLES30.glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+        GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+        GLES30.glClear(GLES30.GL_DEPTH_BUFFER_BIT)
+        GLES30.glUseProgram(shadowProgram)
+        setMat4(shadowProgram, "uLightVP", lightVP)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, sceneVbo)
+        GLES30.glEnableVertexAttribArray(0)
+        GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 36, 0)
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, sceneVertCount)
+
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, sceneFbo)
         GLES30.glViewport(0, 0, lw, lh)
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
@@ -223,6 +291,10 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glUseProgram(sceneProgram)
         setMat4(sceneProgram, "uProj", proj)
         setMat4(sceneProgram, "uView", view)
+        setMat4(sceneProgram, "uLightVP", lightVP)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, shadowTex)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(sceneProgram, "uShadowMap"), 0)
         setVec3(sceneProgram, "uCam", camX, camY, camZ)
         setVec3(sceneProgram, "uAmbient", ambient[0], ambient[1], ambient[2])
         setVec3(sceneProgram, "uSunDir", 0.4f, 0.9f, 0.3f)
@@ -258,7 +330,7 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlasTex)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(glyphProgram, "uAtlas"), 1)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(glyphProgram, "uRes"), screenW.toFloat(), screenH.toFloat())
-        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 170).coerceIn(2, 4).toFloat()
+        val cellPx = if (glyphCellPx > 0f) glyphCellPx else (screenW / 55).coerceIn(10, 16).toFloat()
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uCellPx"), cellPx)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uToneCount"), toneGlyphs.size.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(glyphProgram, "uAtlasCount"), allGlyphs.size.toFloat())
@@ -327,26 +399,52 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
             layout(location=0) in vec3 aPos;
             layout(location=1) in vec3 aNormal;
             layout(location=2) in vec3 aColor;
-            uniform mat4 uProj, uView;
+            uniform mat4 uProj, uView, uLightVP;
             out vec3 vN, vCol, vWP;
+            out vec4 vLightSpacePos;
             void main(){
                 vWP = aPos; vN = aNormal; vCol = aColor;
+                vLightSpacePos = uLightVP * vec4(aPos, 1.0);
                 gl_Position = uProj * uView * vec4(aPos, 1.0);
             }
+        """
+
+        const val SHADOW_VS = """#version 300 es
+            layout(location=0) in vec3 aPos;
+            uniform mat4 uLightVP;
+            void main(){ gl_Position = uLightVP * vec4(aPos, 1.0); }
+        """
+
+        const val SHADOW_FS = """#version 300 es
+            precision mediump float;
+            void main(){ }
         """
 
         const val SCENE_FS = """#version 300 es
             precision highp float;
             in vec3 vN, vCol, vWP;
+            in vec4 vLightSpacePos;
             uniform vec3 uCam, uAmbient, uSunDir, uSunCol, uFog;
             uniform float uFogD;
             uniform vec3 uLP[3];
             uniform vec3 uLC[3];
+            uniform sampler2D uShadowMap;
             out vec4 outColor;
+
+            float shadowFactor(){
+                vec3 proj = vLightSpacePos.xyz / vLightSpacePos.w;
+                proj = proj * 0.5 + 0.5;
+                if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0 || proj.z < 0.0) return 1.0;
+                float shadowDepth = texture(uShadowMap, proj.xy).r;
+                float bias = 0.0035;
+                return (proj.z - bias > shadowDepth) ? 0.35 : 1.0;
+            }
+
             void main(){
                 vec3 n = normalize(vN);
                 vec3 light = uAmbient;
-                light += uSunCol * max(dot(n, normalize(uSunDir)), 0.0);
+                float shadow = shadowFactor();
+                light += uSunCol * max(dot(n, normalize(uSunDir)), 0.0) * shadow;
                 for (int i = 0; i < 3; i++) {
                     vec3 toL = uLP[i] - vWP;
                     float d = length(toL);
@@ -435,8 +533,8 @@ class GlyphRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
                 vec2 local = fract(frag / uCellPx);
                 float gap = uGapFrac;
-                vec3 bg = avgColor * 0.55;
-                vec3 ink = avgColor * 1.6;
+                vec3 bg = avgColor * 0.42;
+                vec3 ink = avgColor * 1.8;
                 vec3 col;
                 if (local.x < gap || local.x > 1.0-gap || local.y < gap || local.y > 1.0-gap) {
                     col = bg;
